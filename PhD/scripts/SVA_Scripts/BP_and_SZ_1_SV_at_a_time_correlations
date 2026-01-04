@@ -1,0 +1,900 @@
+#################### Adding 1 SV at a time then correlation for SZ and BP ########################################  
+##################################################################################################################
+##from BP/SZ code for publication.R
+#Code for ROSMAP and MSBB  is in MSBB code for publication 11122024.sh
+
+####################################################### FOR BP ######################################################
+rm(list=ls()) 
+#load('/sc/arion/projects/mscic1/results/jolie/CMC/BP/metadata_8.2.2024.Rdata') #old one
+load('/sc/arion/projects/mscic1/results/jolie/CMC/BP/no_sva_02022025.Rdata')
+
+#library(githubr) #Error in library(githubr) : there is no package called ‘githubr’
+library(ggplot2)
+library(dplyr)
+library(ComplexHeatmap)
+library(readxl)
+library(gtools)
+library(corrplot)
+library(fdrtool)
+library(ashr)
+library(pvclust)
+library(RColorBrewer)
+library(metafor)
+library(data.table)
+library(cowplot)
+library(ggraph)
+library(tidygraph)
+library(kableExtra)
+library(ggrepel)
+library(corpcor)
+library(corrplot)
+#library(zenith) #could not load
+library(compositions)
+library(knitr)
+library(patchwork)
+library(plyr) 
+library(BiocParallel)
+library(readr)
+library(limma)
+library(edgeR)
+library(sva)
+library(variancePartition)
+
+head(hbcc_no_sva_bp)
+head(mssm_no_sva_bp)
+
+###dont run the next two lines, here as a summary -- 
+#n.sv = num.sv(v.MSSM$E,design.MSSM,method="be") #36 SVs for be and 0 for leek
+#n.sv = num.sv(v.HBCC$E,design.HBCC,method="be") #29 SVs for be and 0 for leek - nsv here changes btw 29 and 30!
+
+### START HERE: add 1 SV at a time for BP MSSM and HBCC and test their correlation 
+# Step 1: Estimate the number of SVs
+n.sv = num.sv(v.MSSM$E, design.MSSM, method = "be") 
+
+# Initialize a list to store results for each DEA
+all_results_sv <- list()
+
+# Loop through the number of SVs from 1 to the estimated n.sv
+for (i in 1:n.sv) {
+  cat("Running DEA with", i, "SV(s)\n")
+  
+  # Step 2: Generate SVs with the current number `i`
+  svobj <- sva(v.MSSM$E, design.MSSM, design0.MSSM, n.sv = i)
+  temp <- svobj$sv
+  colnames(temp) <- paste0('sv', 1:ncol(temp))
+  
+  # Step 3: Create the design matrix with `i` SVs
+  design_sv <- cbind(design.MSSM, temp)
+
+  # Step 4: Perform DEA using limma
+  fit_sv <- lmFit(v.MSSM$E, design_sv)  # Ensure correct input matrix
+  fit2 <- eBayes(fit_sv)  
+  results_sv <- topTable(fit2, coef = "DxBP", number = Inf) 
+
+  # Add gene names to the results and reformat
+  results_sv$X <- rownames(results_sv)
+  results_sv_formatted <- results_sv[, c("X", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")]
+  row.names(results_sv_formatted) <- 1:nrow(results_sv_formatted)
+  
+  # Store the results in the list
+  all_results_sv[[i]] <- results_sv_formatted
+}
+
+# Directory where results will be stored
+output_dir <- "/sc/arion/projects/mscic1/results/jolie/CMC/BP/"
+
+# Save results to CSV files
+for (i in 1:n.sv) {
+  file_path <- file.path(output_dir, paste0("bp_mssm_sva_be_", i, "_SVs.csv"))
+  write.csv(all_results_sv[[i]], file = file_path, row.names = FALSE)
+}
+
+# mssm_0sv <- fread("/sc/arion/projects/mscic1/results/jolie/CMC/BP/mssm_no_sva_bp_11302024.txt", data.table = FALSE)
+# write.csv(mssm_0sv, "/sc/arion/projects/mscic1/results/jolie/CMC/BP/bp_mssm_sva_be_0_SVs.csv",row.names = FALSE)
+
+#mssm_0sv <- read.csv("/sc/arion/projects/mscic1/results/jolie/CMC/BP/bp_mssm_sva_be_0_SVs.csv")
+#mssm_9sv <- read.csv("/sc/arion/projects/mscic1/results/jolie/CMC/BP/bp_mssm_sva_be_9_SVs.csv")
+
+####################################### HBCC ####################################################
+n.sv = num.sv(v.HBCC$E, design.HBCC, method = "be") ## 29 on 02-02-2025
+
+# Initialize a list to store results for each DEA
+all_results_sv <- list()
+
+# Loop through the number of SVs from 1 to the estimated n.sv
+for (i in 1:n.sv) {
+  cat("Running DEA with", i, "SV(s)\n")
+  
+  # Step 2: Generate SVs with the current number `i`
+  svobj <- sva(v.HBCC$E, design.HBCC, design0.HBCC, n.sv = i)
+  temp <- svobj$sv
+  colnames(temp) <- paste0('sv', 1:ncol(temp))
+  
+  # Step 3: Create the design matrix with `i` SVs
+  design_sv <- cbind(design.HBCC, temp)
+  
+  # Step 4: Perform DEA using limma
+  fit_sv <- lmFit(v.HBCC$E, design_sv)  # Ensure correct input matrix
+  fit2 <- eBayes(fit_sv)  
+  results_sv <- topTable(fit2, coef = "DxBP", number = Inf) 
+  
+  # Add gene names to the results and reformat
+  results_sv$X <- rownames(results_sv)
+  results_sv_formatted <- results_sv[, c("X", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")]
+  row.names(results_sv_formatted) <- 1:nrow(results_sv_formatted)
+  
+  # Store the results in the list
+  all_results_sv[[i]] <- results_sv_formatted
+}
+
+# Directory where results will be stored
+output_dir <- "/sc/arion/projects/mscic1/results/jolie/CMC/BP/"
+
+# Save results to CSV files
+for (i in 1:n.sv) {
+  file_path <- file.path(output_dir, paste0("bp_hbcc_sva_be_", i, "_SVs.csv"))
+  write.csv(all_results_sv[[i]], file = file_path, row.names = FALSE)
+}
+
+# hbcc_0sv <- fread("/sc/arion/projects/mscic1/results/jolie/CMC/BP/hbcc_no_sva_bp_11302024.txt", data.table = FALSE)
+# write.csv(hbcc_0sv, "/sc/arion/projects/mscic1/results/jolie/CMC/BP/bp_hbcc_sva_be_0_SVs.csv",row.names = FALSE)
+
+# hbcc_0sv <- read.csv("/sc/arion/projects/mscic1/results/jolie/CMC/BP/bp_hbcc_sva_be_0_SVs.csv")
+# hbcc_9sv <- read.csv("/sc/arion/projects/mscic1/results/jolie/CMC/BP/bp_hbcc_sva_be_9_SVs.csv")
+
+############################################################
+####################### correlations #######################
+############################################################
+# Create file names with full paths for MSBB and ROSMAP ---- START HERE
+output_dir <- "/sc/arion/projects/mscic1/results/jolie/CMC/BP/"
+
+hbcc_files <- paste0(output_dir, "bp_hbcc_sva_be_", 0:29, "_SVs.csv") #limiting factor with 29 SVs
+mssm_files <- paste0(output_dir, "bp_mssm_sva_be_", 0:29, "_SVs.csv")
+
+# Load sva datasets
+hbcc_list <- lapply(hbcc_files, read.csv)
+mssm_list <- lapply(mssm_files, read.csv)
+
+# Convert sva datasets to data frames for consistency
+hbcc_list <- lapply(hbcc_list, as.data.frame)
+mssm_list <- lapply(mssm_list, as.data.frame)
+
+# Confirm the lists have 30 elements each (nsv=0 to nsv=29)
+cat("hbcc list length:", length(hbcc_list), "\n")
+cat("mssm list length:", length(mssm_list), "\n")
+
+##genes are not aligned, check: 
+head(hbcc_list[[2]])
+head(mssm_list[[29]])
+
+tmp=lapply(mssm_list,function(x){x$adj.P.Val<=0.05})
+sapply(tmp,table)
+
+##align the genes - hbcc
+# Step 1: Identify the common set of genes across all datasets
+common_genes <- Reduce(intersect, lapply(hbcc_list, function(df) df$X))
+
+# Step 2: Subset each dataset to include only the common genes
+hbcc_list <- lapply(hbcc_list, function(df) df[df$X %in% common_genes, ])
+
+# Step 3: Sort each dataset by the 'X' column to ensure consistent order
+hbcc_list <- lapply(hbcc_list, function(df) df[order(df$X), ])
+
+# Step 4: Verify alignment
+alignment_check <- all(sapply(hbcc_list, function(df) identical(df$X, hbcc_list[[1]]$X)))
+
+if (alignment_check) {
+  cat("Genes are successfully aligned across all datasets.\n")
+} else {
+  cat("Gene alignment failed. Check for issues in the datasets.\n")
+}
+
+##align the genes - mssm
+# Step 1: Identify the common set of genes across all datasets in mssm_list
+common_genes_mssm <- Reduce(intersect, lapply(mssm_list, function(df) df$X))
+
+# Step 2: Subset each dataset in mssm_list to include only the common genes
+mssm_list <- lapply(mssm_list, function(df) df[df$X %in% common_genes_mssm, ])
+
+# Step 3: Sort each dataset by the 'X' column to ensure consistent order
+mssm_list <- lapply(mssm_list, function(df) df[order(df$X), ])
+
+# Step 4: Verify alignment
+alignment_check_mssm <- all(sapply(mssm_list, function(df) identical(df$X, mssm_list[[1]]$X)))
+
+if (alignment_check_mssm) {
+  cat("Genes are successfully aligned across all mssm datasets.\n")
+} else {
+  cat("Gene alignment failed for mssm datasets. Check for issues in the datasets.\n")
+}
+
+# Initialize a matrix to store Spearman correlation results (30x30)
+cor_results_matrix <- matrix(NA, nrow = 30, ncol = 30)
+
+# Loop through all combinations of hbcc and mssm SVs (0 to 29)
+for (i in 1:30) {
+  for (j in 1:30) {
+    # Merge the i-th hbcc dataset with the j-th mssm dataset by 'X'
+    sv_combo <- merge(
+      hbcc_list[[i]], 
+      mssm_list[[j]], 
+      by = 'X', 
+      all.x = TRUE, 
+      all.y = TRUE, 
+      suffixes = c('_hbcc', '_mssm')
+    )
+    
+    # Check if logFC columns exist and have non-NA values
+    if ("logFC_hbcc" %in% names(sv_combo) && "logFC_mssm" %in% names(sv_combo)) {
+      valid_data <- !is.na(sv_combo$logFC_hbcc) & !is.na(sv_combo$logFC_mssm)
+      if (sum(valid_data) > 0) {
+        cor_test <- cor.test(
+          sv_combo$logFC_hbcc[valid_data], 
+          sv_combo$logFC_mssm[valid_data], 
+          method = "spearman", 
+          exact = FALSE
+        )
+        cor_results_matrix[i, j] <- cor_test$estimate
+      }
+    }
+  }
+}
+
+# Convert the matrix into a long-form data frame
+correlation_df <- as.data.frame(as.table(cor_results_matrix))
+names(correlation_df) <- c("hbcc_SV", "mssm_SV", "Correlation")
+
+# Map SV=0 to SV=29 for the new dimension
+correlation_df$hbcc_SV <- as.numeric(correlation_df$hbcc_SV) - 1
+correlation_df$mssm_SV <- as.numeric(correlation_df$mssm_SV) - 1
+
+# Ensure all combinations from SV=0 to SV=29 are present
+all_svs <- expand.grid(hbcc_SV = 0:29, mssm_SV = 0:29)
+correlation_df <- merge(all_svs, correlation_df, by = c("hbcc_SV", "mssm_SV"), all.x = TRUE)
+
+plot <- ggplot(correlation_df, aes(x = hbcc_SV, y = mssm_SV, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  geom_text(aes(label = ifelse(is.na(Correlation), "", sprintf("%.2f", Correlation))), 
+            color = "black", size = 3) +
+  scale_fill_gradient2(low = "white", high = "#79AC78")+
+  scale_x_continuous(breaks = 0:29, expand = c(0, 0)) +
+  scale_y_continuous(breaks = 0:29, expand = c(0, 0)) +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20),  # Increase left margin
+    panel.spacing = unit(0, "lines")
+  ) +
+  labs(
+    title = "Spearman Correlation Heatmap: HBCC vs MSSM in Bipolar Disease",
+    x = "BP - HBCC Surrogate Variables",
+    y = "BP - MSSM Surrogate Variables"
+  )
+
+#, mid = "white", midpoint = 0, na.value = "grey50") +
+
+#OG
+ggsave("/hpc/users/hoangd02/www/plots/bp_mssm_hbcc_corr_0_to_29_heatmap.pdf",plot = plot, width = 11, height = 11, units = "in", dpi = 300)
+
+
+##ADDING THE COUNT OF OVERLAPPING GENES ON THE TILES INSTEAD OF THE SPEARMAN RHO
+# Initialize matrices for Spearman correlation and overlap counts
+cor_results_matrix <- matrix(NA, nrow = 30, ncol = 30)
+overlap_counts_matrix <- matrix(NA, nrow = 30, ncol = 30)
+
+# Loop through all combinations of hbcc and mssm SVs (0 to 29)
+for (i in 1:30) {
+  for (j in 1:30) {
+    # Merge the i-th hbcc dataset with the j-th mssm dataset by 'X'
+    sv_combo <- merge(
+      hbcc_list[[i]], 
+      mssm_list[[j]], 
+      by = 'X', 
+      all.x = TRUE, 
+      all.y = TRUE, 
+      suffixes = c('_hbcc', '_mssm')
+    )
+    
+    # Calculate Spearman correlation if logFC columns exist
+    if ("logFC_hbcc" %in% names(sv_combo) && "logFC_mssm" %in% names(sv_combo)) {
+      valid_data <- !is.na(sv_combo$logFC_hbcc) & !is.na(sv_combo$logFC_mssm)
+      if (sum(valid_data) > 0) {
+        cor_test <- cor.test(
+          sv_combo$logFC_hbcc[valid_data], 
+          sv_combo$logFC_mssm[valid_data], 
+          method = "spearman", 
+          exact = FALSE
+        )
+        cor_results_matrix[i, j] <- cor_test$estimate
+      }
+    }
+    
+    # Count overlapping significant genes
+    if ("adj.P.Val_hbcc" %in% names(sv_combo) && "adj.P.Val_mssm" %in% names(sv_combo)) {
+      significant_genes <- sv_combo$adj.P.Val_hbcc <= 0.05 & sv_combo$adj.P.Val_mssm <= 0.05
+      overlap_counts_matrix[i, j] <- sum(significant_genes, na.rm = TRUE)
+    }
+  }
+}
+
+# Convert matrices into long-form data frames
+correlation_df <- as.data.frame(as.table(cor_results_matrix))
+names(correlation_df) <- c("hbcc_SV", "mssm_SV", "Correlation")
+
+overlap_df <- as.data.frame(as.table(overlap_counts_matrix))
+names(overlap_df) <- c("hbcc_SV", "mssm_SV", "OverlapCount")
+
+# Map SV=0 to SV=29 for the new dimension
+correlation_df$hbcc_SV <- as.numeric(correlation_df$hbcc_SV) - 1
+correlation_df$mssm_SV <- as.numeric(correlation_df$mssm_SV) - 1
+overlap_df$hbcc_SV <- as.numeric(overlap_df$hbcc_SV) - 1
+overlap_df$mssm_SV <- as.numeric(overlap_df$mssm_SV) - 1
+
+# Merge correlation and overlap data frames
+heatmap_df <- merge(correlation_df, overlap_df, by = c("hbcc_SV", "mssm_SV"), all.x = TRUE)
+
+# Ensure all combinations from SV=0 to SV=29 are present
+all_svs <- expand.grid(hbcc_SV = 0:29, mssm_SV = 0:29)
+heatmap_df <- merge(all_svs, heatmap_df, by = c("hbcc_SV", "mssm_SV"), all.x = TRUE)
+
+# Calculate the total number of significant genes in hbcc
+#hbcc_no_sva <- read.csv("/sc/arion/projects/mscic1/results/jolie/CMC/BP/bp_hbcc_sva_be_0_SVs.csv")
+hbcc_no_sva <-fread("/sc/arion/projects/mscic1/results/jolie/CMC/BP/hbcc_no_sva_bp_11302024.txt",data.table=FALSE)
+total_significant_hbcc <- sum(hbcc_no_sva$adj.P.Val <= 0.05, na.rm = TRUE)
+total_significant_hbcc #1303 DEGs
+
+# Calculate the total number of significant genes in mssm
+#mssm_no_sva <- read.csv("/sc/arion/projects/mscic1/results/jolie/CMC/BP/bp_mssm_sva_be_0_SVs.csv")
+mssm_no_sva <-fread("/sc/arion/projects/mscic1/results/jolie/CMC/BP/mssm_no_sva_bp_11302024.txt",data.table=FALSE)
+total_significant_mssm <- sum(mssm_no_sva$adj.P.Val <= 0.05, na.rm = TRUE)
+total_significant_mssm #33 DEGs
+
+# Function to calculate total significant genes for a given list of datasets
+calculate_significant_genes <- function(data_list) {
+  sapply(data_list, function(data) sum(data$adj.P.Val <= 0.05, na.rm = TRUE))
+}
+
+# Calculate the total number of significant genes for hbcc and mssm for each SV
+hbcc_significant_genes <- calculate_significant_genes(hbcc_list)
+mssm_significant_genes <- calculate_significant_genes(mssm_list)
+
+# Create custom axis labels for hbcc and mssm
+hbcc_labels <- paste0(0:29, " SV (", hbcc_significant_genes, " DEGs)")
+mssm_labels <- paste0(0:29, " SV (", mssm_significant_genes, " DEGs)")
+
+# Add labels to the heatmap data frame for plotting
+heatmap_df$hbcc_Label <- factor(
+  heatmap_df$hbcc_SV, 
+  levels = 0:29, 
+  labels = hbcc_labels
+)
+heatmap_df$mssm_Label <- factor(
+  heatmap_df$mssm_SV, 
+  levels = 0:29, 
+  labels = mssm_labels
+)
+
+# Plot the heatmap with custom axis labels
+plot <- ggplot(heatmap_df, aes(x = hbcc_Label, y = mssm_Label, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  geom_text(aes(label = ifelse(is.na(OverlapCount), "", OverlapCount)), 
+            color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, 
+                       name = expression("Spearman's\nCorrelation " * rho)) +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size=18),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20)  # Increase left margin
+  ) +
+  labs(
+    title = "Spearman Correlation Heatmap: HBCC vs MSSM in Bipolar Disease",
+    x = "HBCC",
+    y = "MSSM"
+  )
+
+ggsave("/hpc/users/hoangd02/www/plots/bp_mssm_hbcc_corr_0_to_29_heatmap_with_overlapping_genes_02052025.pdf", plot=plot, width = 11, height = 11, units = "in", dpi = 300)
+
+#############################################################################
+## new code with correlation values and DEGs
+# Assume OverlapCount is already in correlation_df
+# If not, you need to add a column named OverlapCount before plotting
+plot <- ggplot(heatmap_df, aes(x = hbcc_Label, y = mssm_Label, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  geom_text(
+    aes(label = ifelse(
+      is.na(Correlation), "", 
+      sprintf("%.2f\n(%s)", Correlation, OverlapCount)
+    )), 
+    color = "black", size = 3.2, lineheight = 0.9
+  ) +
+  scale_fill_gradient2(low = "white", high = "#79AC78") +
+  # scale_x_continuous(breaks = 0:29, expand = c(0, 0)) +
+  # scale_y_continuous(breaks = 0:29, expand = c(0, 0)) +
+  coord_fixed() +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20),
+    panel.spacing = unit(0, "lines")
+  ) +
+  labs(
+    title = "Spearman Correlation Heatmap: CMC vs CMC-HBCC in Bipolar Disorder",
+    x = "BP: CMC-HBCC Surrogate Variables",
+    y = "BP: CMC Surrogate Variables"
+  )
+ggsave("/hpc/users/hoangd02/www/plots/bp_mssm_hbcc_corr_0_to_29_heatmap_with_overlapping_genes_and_corr_values.pdf", plot=plot, width = 15, height = 15)
+
+heatmap_df_subset1 <- subset(heatmap_df, hbcc_SV <= 10 & mssm_SV <= 10)
+
+ps1 <- ggplot(heatmap_df_subset1, aes(x = hbcc_Label, y = mssm_Label, fill = Correlation)) +
+  geom_tile(color = "white", size = 0.1) +
+  geom_text(
+    aes(label = ifelse(
+      is.na(Correlation), "", 
+      sprintf("%.2f\n(%s)", Correlation, OverlapCount)
+    )), 
+    color = "black", size = 3, lineheight = 0.9  # reduced from 4.5
+  ) +
+  scale_fill_gradient2(low = "white", high = "#79AC78") +
+  coord_fixed() +
+  theme_minimal(base_size = 10) +  # reduced from 14
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title.x = element_text(size = 10, face = "bold"),
+    axis.title.y = element_text(size = 10, face = "bold"),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20)
+  ) +
+  labs(
+    title = "Spearman Correlation Heatmap for BP (SVs = 0 to 10)",
+    x = "BP: CMC-HBCC Surrogate Variables",
+    y = "BP: CMC Surrogate Variables"
+  )
+
+ggsave("/hpc/users/hoangd02/www/plots/bp_mssm_hbcc_corr_0_to_10_heatmap_with_overlapping_genes_and_cor_values.pdf", plot = ps1, width = 8, height = 8)
+
+################################################################################################################################################# SCHIZOPHRENIA ##############################################################################################################################################################
+load('/sc/arion/projects/mscic1/results/jolie/CMC/sz_no_sva_02022025.Rdata') 
+
+###dont run the next two lines, here as a summary -- 
+n.sv = num.sv(v.MSSM$E,design.MSSM,method="leek") #50 SVs for be and 0 for leek
+n.sv = num.sv(v.HBCC$E,design.HBCC,method="leek") #31 SVs for be and 0 for leek 
+
+### START HERE: add 1 SV at a time for BP MSSM and HBCC and test their correlation 
+# Step 1: Estimate the number of SVs
+n.sv = num.sv(v.MSSM$E, design.MSSM, method = "be") 
+
+# Initialize a list to store results for each DEA
+all_results_sv <- list()
+
+# Loop through the number of SVs from 1 to the estimated n.sv
+for (i in 1:n.sv) {
+  cat("Running DEA with", i, "SV(s)\n")
+  
+  # Step 2: Generate SVs with the current number `i`
+  svobj <- sva(v.MSSM$E, design.MSSM, design0.MSSM, n.sv = i)
+  temp <- svobj$sv
+  colnames(temp) <- paste0('sv', 1:ncol(temp))
+  
+  # Step 3: Create the design matrix with `i` SVs
+  design_sv <- cbind(design.MSSM, temp)
+
+  # Step 4: Perform DEA using limma
+  fit_sv <- lmFit(v.MSSM$E, design_sv)  # Ensure correct input matrix
+  fit2 <- eBayes(fit_sv)  
+  results_sv <- topTable(fit2, coef = "DxSCZ", number = Inf) 
+
+  # Add gene names to the results and reformat
+  results_sv$X <- rownames(results_sv)
+  results_sv_formatted <- results_sv[, c("X", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")]
+  row.names(results_sv_formatted) <- 1:nrow(results_sv_formatted)
+  
+  # Store the results in the list
+  all_results_sv[[i]] <- results_sv_formatted
+}
+
+# Directory where results will be stored
+output_dir <- "/sc/arion/projects/mscic1/results/jolie/CMC/"
+
+# Save results to CSV files
+for (i in 1:n.sv) {
+  file_path <- file.path(output_dir, paste0("sz_mssm_sva_be_", i, "_SVs.csv"))
+  write.csv(all_results_sv[[i]], file = file_path, row.names = FALSE)
+}
+
+
+# sz_mssm_no_sva <-fread("/sc/arion/projects/mscic1/results/jolie/CMC/mssm_no_sva.txt",data.table=FALSE)
+# write.csv(sz_mssm_no_sva, "/sc/arion/projects/mscic1/results/jolie/CMC/sz_mssm_sva_be_0_SVs.csv",row.names = FALSE)
+
+####################################### HBCC ####################################################
+n.sv = num.sv(v.HBCC$E, design.HBCC, method = "be") 
+
+# Initialize a list to store results for each DEA
+all_results_sv <- list()
+
+# Loop through the number of SVs from 1 to the estimated n.sv
+for (i in 1:n.sv) {
+  cat("Running DEA with", i, "SV(s)\n")
+  
+  # Step 2: Generate SVs with the current number `i`
+  svobj <- sva(v.HBCC$E, design.HBCC, design0.HBCC, n.sv = i)
+  temp <- svobj$sv
+  colnames(temp) <- paste0('sv', 1:ncol(temp))
+  
+  # Step 3: Create the design matrix with `i` SVs
+  design_sv <- cbind(design.HBCC, temp)
+  
+  # Step 4: Perform DEA using limma
+  fit_sv <- lmFit(v.HBCC$E, design_sv)  # Ensure correct input matrix
+  fit2 <- eBayes(fit_sv)  
+  results_sv <- topTable(fit2, coef = "DxSCZ", number = Inf) 
+  
+  # Add gene names to the results and reformat
+  results_sv$X <- rownames(results_sv)
+  results_sv_formatted <- results_sv[, c("X", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val", "B")]
+  row.names(results_sv_formatted) <- 1:nrow(results_sv_formatted)
+  
+  # Store the results in the list
+  all_results_sv[[i]] <- results_sv_formatted
+}
+
+# Directory where results will be stored
+output_dir <- "/sc/arion/projects/mscic1/results/jolie/CMC/"
+
+# Save results to CSV files
+for (i in 1:n.sv) {
+  file_path <- file.path(output_dir, paste0("sz_hbcc_sva_be_", i, "_SVs.csv"))
+  write.csv(all_results_sv[[i]], file = file_path, row.names = FALSE)
+}
+
+# sz_hbcc_no_sva <-fread("/sc/arion/projects/mscic1/results/jolie/CMC/hbcc_no_sva.txt",data.table=FALSE)
+# write.csv(sz_hbcc_no_sva, "/sc/arion/projects/mscic1/results/jolie/CMC/sz_hbcc_sva_be_0_SVs.csv",row.names = FALSE)
+
+############################################################
+####################### correlations #######################
+############################################################
+# Create file names with full paths for MSBB and ROSMAP -- START HERE
+output_dir <- "/sc/arion/projects/mscic1/results/jolie/CMC/"
+
+hbcc_files <- paste0(output_dir, "sz_hbcc_sva_be_", 0:31, "_SVs.csv") #limiting factor with 31 SVs
+mssm_files <- paste0(output_dir, "sz_mssm_sva_be_", 0:31, "_SVs.csv")
+
+# Load sva datasets
+hbcc_list <- lapply(hbcc_files, read.csv)
+mssm_list <- lapply(mssm_files, read.csv)
+
+# Convert sva datasets to data frames for consistency
+hbcc_list <- lapply(hbcc_list, as.data.frame)
+mssm_list <- lapply(mssm_list, as.data.frame)
+
+# Confirm the lists have 32 elements each (nsv=0 to nsv=31)
+cat("hbcc list length:", length(hbcc_list), "\n")
+cat("mssm list length:", length(mssm_list), "\n")
+
+##genes are not aligned, check: 
+head(hbcc_list[[2]])
+head(mssm_list[[29]])
+
+tmp=lapply(mssm_list,function(x){x$adj.P.Val<=0.05})
+sapply(tmp,table)
+
+##align the genes - hbcc
+# Step 1: Identify the common set of genes across all datasets
+common_genes <- Reduce(intersect, lapply(hbcc_list, function(df) df$X))
+
+# Step 2: Subset each dataset to include only the common genes
+hbcc_list <- lapply(hbcc_list, function(df) df[df$X %in% common_genes, ])
+
+# Step 3: Sort each dataset by the 'X' column to ensure consistent order
+hbcc_list <- lapply(hbcc_list, function(df) df[order(df$X), ])
+
+# Step 4: Verify alignment
+alignment_check <- all(sapply(hbcc_list, function(df) identical(df$X, hbcc_list[[1]]$X)))
+
+if (alignment_check) {
+  cat("Genes are successfully aligned across all datasets.\n")
+} else {
+  cat("Gene alignment failed. Check for issues in the datasets.\n")
+}
+
+##align the genes - mssm
+# Step 1: Identify the common set of genes across all datasets in mssm_list
+common_genes_mssm <- Reduce(intersect, lapply(mssm_list, function(df) df$X))
+
+# Step 2: Subset each dataset in mssm_list to include only the common genes
+mssm_list <- lapply(mssm_list, function(df) df[df$X %in% common_genes_mssm, ])
+
+# Step 3: Sort each dataset by the 'X' column to ensure consistent order
+mssm_list <- lapply(mssm_list, function(df) df[order(df$X), ])
+
+# Step 4: Verify alignment
+alignment_check_mssm <- all(sapply(mssm_list, function(df) identical(df$X, mssm_list[[1]]$X)))
+
+if (alignment_check_mssm) {
+  cat("Genes are successfully aligned across all mssm datasets.\n")
+} else {
+  cat("Gene alignment failed for mssm datasets. Check for issues in the datasets.\n")
+}
+
+# Initialize a matrix to store Spearman correlation results 
+cor_results_matrix <- matrix(NA, nrow = 32, ncol = 32)
+
+# Loop through all combinations of hbcc and mssm SVs (0 to 31)
+for (i in 1:32) {
+  for (j in 1:32) {
+    # Merge the i-th hbcc dataset with the j-th mssm dataset by 'X'
+    sv_combo <- merge(
+      hbcc_list[[i]], 
+      mssm_list[[j]], 
+      by = 'X', 
+      all.x = TRUE, 
+      all.y = TRUE, 
+      suffixes = c('_hbcc', '_mssm')
+    )
+    
+    # Check if logFC columns exist and have non-NA values
+    if ("logFC_hbcc" %in% names(sv_combo) && "logFC_mssm" %in% names(sv_combo)) {
+      valid_data <- !is.na(sv_combo$logFC_hbcc) & !is.na(sv_combo$logFC_mssm)
+      if (sum(valid_data) > 0) {
+        cor_test <- cor.test(
+          sv_combo$logFC_hbcc[valid_data], 
+          sv_combo$logFC_mssm[valid_data], 
+          method = "spearman", 
+          exact = FALSE
+        )
+        cor_results_matrix[i, j] <- cor_test$estimate
+      }
+    }
+  }
+}
+
+# Convert the matrix into a long-form data frame
+correlation_df <- as.data.frame(as.table(cor_results_matrix))
+names(correlation_df) <- c("hbcc_SV", "mssm_SV", "Correlation")
+
+# Map SV=0 to SV=31 for the new dimension
+correlation_df$hbcc_SV <- as.numeric(correlation_df$hbcc_SV) - 1
+correlation_df$mssm_SV <- as.numeric(correlation_df$mssm_SV) - 1
+
+# Ensure all combinations from SV=0 to SV=31 are present
+all_svs <- expand.grid(hbcc_SV = 0:31, mssm_SV = 0:31)
+correlation_df <- merge(all_svs, correlation_df, by = c("hbcc_SV", "mssm_SV"), all.x = TRUE)
+
+plot <- ggplot(correlation_df, aes(x = hbcc_SV, y = mssm_SV, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  geom_text(aes(label = ifelse(is.na(Correlation), "", sprintf("%.2f", Correlation))), 
+            color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, 
+                       na.value = "grey50") +
+  scale_x_continuous(breaks = 0:31, expand = c(0, 0)) +
+  scale_y_continuous(breaks = 0:31, expand = c(0, 0)) +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20),  # Increase left margin
+    panel.spacing = unit(0, "lines")
+  ) +
+  labs(
+    title = "Spearman Correlation Heatmap: HBCC vs MSSM in Schizophrenia",
+    x = "SZ - HBCC Surrogate Variables",
+    y = "SZ - MSSM Surrogate Variables"
+  )
+
+# Save with proper dimensions and resolution
+ggsave("/hpc/users/hoangd02/www/plots/sz_mssm_hbcc_corr_0_to_31_heatmap.pdf",plot = plot, width = 11, height = 11, units = "in", dpi = 300)
+
+##ADDING THE COUNT OF OVERLAPPING GENES ON THE TILES INSTEAD OF THE SPEARMAN RHO
+# Initialize matrices for Spearman correlation and overlap counts
+cor_results_matrix <- matrix(NA, nrow = 32, ncol = 32)
+overlap_counts_matrix <- matrix(NA, nrow = 32, ncol = 32)
+
+# Loop through all combinations of hbcc and mssm SVs (0 to 31)
+for (i in 1:32) {
+  for (j in 1:32) {
+    # Merge the i-th hbcc dataset with the j-th mssm dataset by 'X'
+    sv_combo <- merge(
+      hbcc_list[[i]], 
+      mssm_list[[j]], 
+      by = 'X', 
+      all.x = TRUE, 
+      all.y = TRUE, 
+      suffixes = c('_hbcc', '_mssm')
+    )
+    
+    # Calculate Spearman correlation if logFC columns exist
+    if ("logFC_hbcc" %in% names(sv_combo) && "logFC_mssm" %in% names(sv_combo)) {
+      valid_data <- !is.na(sv_combo$logFC_hbcc) & !is.na(sv_combo$logFC_mssm)
+      if (sum(valid_data) > 0) {
+        cor_test <- cor.test(
+          sv_combo$logFC_hbcc[valid_data], 
+          sv_combo$logFC_mssm[valid_data], 
+          method = "spearman", 
+          exact = FALSE
+        )
+        cor_results_matrix[i, j] <- cor_test$estimate
+      }
+    }
+    
+    # Count overlapping significant genes
+    if ("adj.P.Val_hbcc" %in% names(sv_combo) && "adj.P.Val_mssm" %in% names(sv_combo)) {
+      significant_genes <- sv_combo$adj.P.Val_hbcc <= 0.05 & sv_combo$adj.P.Val_mssm <= 0.05
+      overlap_counts_matrix[i, j] <- sum(significant_genes, na.rm = TRUE)
+    }
+  }
+}
+
+# Convert matrices into long-form data frames
+correlation_df <- as.data.frame(as.table(cor_results_matrix))
+names(correlation_df) <- c("hbcc_SV", "mssm_SV", "Correlation")
+
+overlap_df <- as.data.frame(as.table(overlap_counts_matrix))
+names(overlap_df) <- c("hbcc_SV", "mssm_SV", "OverlapCount")
+
+# Map SV=0 to SV=31 for the new dimension
+correlation_df$hbcc_SV <- as.numeric(correlation_df$hbcc_SV) - 1
+correlation_df$mssm_SV <- as.numeric(correlation_df$mssm_SV) - 1
+overlap_df$hbcc_SV <- as.numeric(overlap_df$hbcc_SV) - 1
+overlap_df$mssm_SV <- as.numeric(overlap_df$mssm_SV) - 1
+
+# Merge correlation and overlap data frames
+heatmap_df <- merge(correlation_df, overlap_df, by = c("hbcc_SV", "mssm_SV"), all.x = TRUE)
+
+# Ensure all combinations from SV=0 to SV=31 are present
+all_svs <- expand.grid(hbcc_SV = 0:31, mssm_SV = 0:31)
+heatmap_df <- merge(all_svs, heatmap_df, by = c("hbcc_SV", "mssm_SV"), all.x = TRUE)
+
+# Calculate the total number of significant genes in hbcc
+sz_hbcc_no_sva <-fread("/sc/arion/projects/mscic1/results/jolie/CMC/hbcc_no_sva.txt",data.table=FALSE)#
+total_significant_hbcc <- sum(sz_hbcc_no_sva$adj.P.Val <= 0.05, na.rm = TRUE)
+total_significant_hbcc # 2065 DEGs
+
+# Calculate the total number of significant genes in mssm
+sz_mssm_no_sva <-fread("/sc/arion/projects/mscic1/results/jolie/CMC/mssm_no_sva.txt",data.table=FALSE)
+total_significant_mssm <- sum(sz_mssm_no_sva$adj.P.Val <= 0.05, na.rm = TRUE)
+total_significant_mssm # 233 DEGs
+
+# Function to calculate total significant genes for a given list of datasets
+calculate_significant_genes <- function(data_list) {
+  sapply(data_list, function(data) sum(data$adj.P.Val <= 0.05, na.rm = TRUE))
+}
+
+# Calculate the total number of significant genes for hbcc and mssm for each SV
+hbcc_significant_genes <- calculate_significant_genes(hbcc_list)
+mssm_significant_genes <- calculate_significant_genes(mssm_list)
+
+# Create custom axis labels for hbcc and mssm
+hbcc_labels <- paste0(0:31, " SV (", hbcc_significant_genes, " DEGs)")
+mssm_labels <- paste0(0:31, " SV (", mssm_significant_genes, " DEGs)")
+
+# Add labels to the heatmap data frame for plotting
+heatmap_df$hbcc_Label <- factor(
+  heatmap_df$hbcc_SV, 
+  levels = 0:31, 
+  labels = hbcc_labels
+)
+heatmap_df$mssm_Label <- factor(
+  heatmap_df$mssm_SV, 
+  levels = 0:31, 
+  labels = mssm_labels
+)
+
+# Plot the heatmap with custom axis labels
+plot <- ggplot(heatmap_df, aes(x = hbcc_Label, y = mssm_Label, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  geom_text(aes(label = ifelse(is.na(OverlapCount), "", OverlapCount)), 
+            color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, 
+                       name = expression("Spearman's\nCorrelation " * rho)) +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size=18),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20)  # Increase left margin
+  ) +
+  labs(
+    title = "Spearman Correlation Heatmap: HBCC vs MSSM in Schizophrenia",
+    x = "HBCC",
+    y = "MSSM"
+  )
+
+# Save with proper dimensions and resolution
+ggsave("/hpc/users/hoangd02/www/plots/sz_mssm_hbcc_corr_0_to_31_heatmap_with_overlapping_genes_02052025.pdf", plot=plot, width = 11, height = 11, units = "in", dpi = 300)
+
+#############################################################################
+## new code with correlation values and DEGs
+# Assume OverlapCount is already in correlation_df
+# If not, you need to add a column named OverlapCount before plotting
+plot <- ggplot(heatmap_df, aes(x = hbcc_Label, y = mssm_Label, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  geom_text(
+    aes(label = ifelse(
+      is.na(Correlation), "", 
+      sprintf("%.2f\n(%s)", Correlation, OverlapCount)
+    )), 
+    color = "black", size = 3.2, lineheight = 0.9
+  ) +
+  scale_fill_gradient2(low = "white", high = "#734F96") +
+  # scale_x_continuous(breaks = 0:29, expand = c(0, 0)) +
+  # scale_y_continuous(breaks = 0:29, expand = c(0, 0)) +
+  coord_fixed() +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20),
+    panel.spacing = unit(0, "lines")
+  ) +
+  labs(
+    title = "Spearman Correlation Heatmap: CMC vs CMC-HBCC in Schizophrenia",
+    x = "SZ: CMC-HBCC Surrogate Variables",
+    y = "SZ: CMC Surrogate Variables"
+  )
+ggsave("/hpc/users/hoangd02/www/plots/sz_mssm_hbcc_corr_0_to_31_heatmap_with_overlapping_genes_and_corr_values.pdf", plot=plot, width = 15, height = 15)
+
+heatmap_df_subset1 <- subset(heatmap_df, hbcc_SV <= 10 & mssm_SV <= 10)
+
+ps1 <- ggplot(heatmap_df_subset1, aes(x = hbcc_Label, y = mssm_Label, fill = Correlation)) +
+  geom_tile(color = "white", size = 0.1) +
+  geom_text(
+    aes(label = ifelse(
+      is.na(Correlation), "", 
+      sprintf("%.2f\n(%s)", Correlation, OverlapCount)
+    )), 
+    color = "black", size = 3, lineheight = 0.9  # reduced from 4.5
+  ) +
+  scale_fill_gradient2(low = "white", high = "#734F96") +
+  coord_fixed() +
+  theme_minimal(base_size = 10) +  # reduced from 14
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title.x = element_text(size = 10, face = "bold"),
+    axis.title.y = element_text(size = 10, face = "bold"),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 20)
+  ) +
+  labs(
+    title = "Spearman Correlation Heatmap for SZ (SVs = 0 to 10)",
+    x = "SZ: CMC-HBCC Surrogate Variables",
+    y = "SZ: CMC Surrogate Variables"
+  )
+
+ggsave("/hpc/users/hoangd02/www/plots/sz_mssm_hbcc_corr_0_to_10_heatmap_with_overlapping_genes_and_cor_values.pdf", plot = ps1, width = 8, height = 8)
+
+
+
+
+
+
+

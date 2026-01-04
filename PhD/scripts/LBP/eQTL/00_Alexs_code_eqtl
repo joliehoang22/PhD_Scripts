@@ -1,0 +1,2133 @@
+# This code runs cis-QTL mapping with QTLtools on an HPC cluster that uses LSF (bsub). The script:
+# 1. sets up paths,
+# 2. builds a big list of QTLtools commands to run (18,000 of them),
+# 3. splits that list into bite-size files,
+# 4. submits many small batch jobs that each run a mini-scheduler called selfsched (via MPI) to execute those commands in parallel,
+# 5. checks that things finished,
+# 6. concatenates chunk outputs into per-parameter files,
+# 7. cleans up.
+
+test<-fread("/sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/DNA/LIVPM_mds.txt")
+
+write.csv(data.frame(ID = colnames(test)),
+          "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/LIVPM_ptIDs.csv",
+          row.names = FALSE)
+
+
+#+NAME: DONE|PRIMARY_QTL_STUFF|run_qtltools
+#+BEGIN_SRC shell
+
+# setup
+  module load qtltools/1.1 tabix
+  IDR=/sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022 # input data
+  SCR=/sc/arion/projects/psychgen/lbp/scratch/runEQTL/20OCT2022 # scratch (unused below)
+  SDR=/sc/arion/projects/psychgen/lbp/scripts/runEQTL/20OCT2022 # scripts + job files + logs live here
+  RDR=/sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022 # results go here
+
+# create directory structure for organizing/tracking selfsched
+  cd ${SDR}
+  mkdir sch run log
+
+# make scripts for selfsched
+  cd ${SDR} 
+  echo "" | tail -n+2 > ${SDR}/selfsched # create/empty the task file
+  rm ${SDR}/sch/* # clear old splits if any
+
+  #Loops that enumerate parameter combinations
+  #For each callset (QC2CALLSET), each nsv (1–30), each data type (MATURERNA, PRERNA), and each chunk (1–300), 
+  #it writes one QTLtools command to the master list.
+
+  for i in QC2CALLSET ##QC2STRICTCALLSET 
+
+  ##what is the difference btw QC2CALLSET and QC2STRICTCALLSET ? seems like there's a matching LIVPM_dna.vcf.gz and LIVPM_dna_strict.vcf.gz 
+  do
+    if [[ ${i} == "QC2CALLSET" ]]
+    then
+      VCF=${IDR}/DNA/LIVPM_dna.vcf.gz #--vcf: genotypes
+      COV=${IDR}/DNA/LIVPM_mds.txt
+    else
+      VCF=${IDR}/DNA/LIVPM_dna_strict.vcf.gz  #--vcf: genotypes
+      COV=${IDR}/DNA/LIVPM_mds_strict.txt
+    fi
+    for j in {1..30} ## nsv = 1..30 (number of surrogate vars / covariate sets)
+    do 
+      for k in MATURERNA PRERNA ##RNA PROTEIN RNAEDITING 
+      do
+        echo ${i} ${j} ${k}
+        BED=${IDR}/${k}/${i}_nsv${j}.bed.gz # expression/covariate in BED-like format for that layer & nsv
+        for l in {1..300} # chunk index 1..300
+        do 
+          OUT=${RDR}/${k}/${i}_qtltoolsOutput_${j}_chunk${l}.txt
+          echo "QTLtools cis --vcf ${VCF} --bed ${BED} --permute 10000 --chunk ${l} 300 --out ${OUT} --cov ${COV}" >> ${SDR}/selfsched
+        #--vcf: genotypes
+        #--bed: expression/covariate in BED-like format for that layer & nsv
+        #--permute: run permutation testing (empirical p-values)
+        #--chunk l 300: split the cis-pairs across 300 chunks and run only chunk l (lets you parallelize)
+        #--cov: covariates (e.g., MDS/PCs, etc.)
+        #--out: output file for that chunk
+        done
+      done
+    done
+  done
+  #Count & split the master list
+  wc -l ${SDR}/selfsched #18000 selfsched
+  split -a4 -d -l50 ${SDR}/selfsched ${SDR}/sch/selfsched_ #split breaks the big file into many small files of 50 lines each in sch/ (so ~360 small lists)
+
+# run selfsched via submiting many small jobs that each run a mini-scheduler
+  cd ${SDR}
+  for i in `l ${SDR}/sch/selfsched_???? | awk -F"_" '{print $NF}'`
+  do
+  echo '#!/bin/bash
+  #BSUB -q premium
+  #BSUB -P acc_psychgen
+  #BSUB -J selfsched_'${i}'
+  #BSUB -n 11
+  #BSUB -W 5:00
+  #BSUB -R "rusage[mem=50000]"
+  #BSUB -cwd '${SDR}'/log
+  #BSUB -oo selfsched_'${i}'.stdout
+  #BSUB -eo selfsched_'${i}'.stderr
+  #BSUB -L /bin/bash
+  module load qtltools/1.1 
+  module load tabix
+  module load selfsched
+  cd '${SDR}'/log 
+  export fstatus=selfsched_'${i}'.fstatus
+  mpirun -np 11 selfsched < '${SDR}'/sch/selfsched_'${i} > ${SDR}/run/selfsched_${i}.run
+  bsub < ${SDR}/run/selfsched_${i}.run
+  done
+
+# check jobs finished and rerun fails if needed
+  #
+  # note: this checking process was complicated and not possible to track here in a neat way 
+  #
+  cd ${SDR}
+  wc -l ${SDR}/selfsched #18000 expected commands
+  find ${RDR}/ -wholename "*${RDR}/*qtltoolsOutput*chunk*.txt" | wc -l #16680 | # how many chunk outputs? 16680 here
+  find ${SDR}/log/ -wholename "*stdout" | wc -l #360 | # number of job logs (360)
+  find ${SDR}/log/ -wholename "*stdout" | xargs -I V grep -m1 -l "Successfully completed" V | wc -l #360 | # count completed jobs (360)
+#sanity check: Were all jobs submitted (360 split files × 50 tasks = 18,000 commands)?
+#Are all chunk outputs present (here: 16,680 suggests some missing/failed chunks—likely rerun was done outside this snippet)?
+
+# combine chunk outputs: For each nsv and layer, it concatenates the 300 chunk files into one result file,
+# ending up with one combined QTLtools output per (callset × nsv × layer)
+  cd ${SDR}
+  for i in QC2CALLSET ##QC2STRICTCALLSET
+  do
+    for j in {1..30}
+    do 
+      for k in MATURERNA PRERNA ##RNA PROTEIN RNAEDITING
+      do cat ${RDR}/${k}/${i}_qtltoolsOutput_${j}_chunk*.txt > ${RDR}/${k}/${i}_qtltoolsOutput_${j}.txt
+      done
+    done
+  done
+
+# clean up
+  cd ${RDR}
+  rm ${RDR}/RNA/QC2{,STRICT}CALLSET*_chunk*.txt & # remove per-chunk files (keeps the combined ones)
+  rm ${RDR}/PROTEIN/QC2{,STRICT}CALLSET*_chunk*.txt &
+  rm ${RDR}/RNAEDITING/QC2CALLSET*_chunk*.txt &
+  rm ${RDR}/RNAEDITING/QC2STRICTCALLSET*_chunk*.txt &
+  rm ${RDR}/MATURERNA/QC2CALLSET*_chunk*.txt &
+  rm ${RDR}/PRERNA/QC2CALLSET*_chunk*.txt &
+  rm -rf ${SDR}/{selfsched,sch,run,log} # remove task lists, splits, run scripts, logs
+
+#+END_SRC
+
+##/sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022/{RNA,PROTEIN,RNAEDITING,MATURERNA,PRERNA}/{QC2CALLSET,QC2STRICTCALLSET}*txt
+
+### EXAMPLES OF VCF AND BED FILES ### 
+
+#################################
+### VCF (Variant Call Format) ###
+#################################
+#Purpose: Contains genotype data — which alleles each sample carries at each genetic variant (e.g., SNP).
+##fileformat=VCFv4.2
+##source=PLINK
+#CHROM  POS       ID          REF  ALT  QUAL  FILTER  INFO  FORMAT   Sample1   Sample2   Sample3
+1       752566    rs3094315   G    A    .     PASS    .     GT       0|0       0|1       1|1
+1       752721    rs3131972   A    G    .     PASS    .     GT       0|1       0|0       0|1
+1       762320    rs11240777  C    T    .     PASS    .     GT       0|0       0|0       0|1
+
+#Header lines (##) describe metadata.
+#CHROM: Chromosome number.
+# POS: Genomic position (1-based).
+# ID: SNP rsID or unique name.
+# REF / ALT: Reference and alternate alleles.
+# FORMAT: Describes how genotype data are stored (here GT = genotype).
+# Sample columns: Each shows the genotype per individual:
+# 0|0 = homozygous reference
+# 0|1 = heterozygous
+# 1|1 = homozygous alternate
+# These genotypes are what QTLtools uses to test for associations with gene expression.
+
+#########################################################
+###  BED (Browser Extensible Data) in QTLtools format ###
+#########################################################
+#In QTLtools, the first 4 columns define the feature (gene/exon), and subsequent columns hold sample-level values.
+#Purpose: Contains phenotype data (e.g., normalized gene expression) in a tab-delimited matrix.
+#chr   start     end       gene_id        Sample1    Sample2   Sample3
+1      11868     14412     ENSG00000223972  5.23       4.87      5.01
+1      14361     29370     ENSG00000227232  7.11       7.35      7.09
+1      29554     31109     ENSG00000243485  3.02       3.19      3.08
+
+#chr / start / end: Genomic location of the feature (gene, exon, or transcript).
+# gene_id: Unique feature ID (e.g., Ensembl gene).
+# Sample columns: Quantitative expression values per sample (log₂(TPM+1), residuals, etc.).
+# These must correspond in order to the samples in the VCF file.
+
+#########################################################
+############### How QTLtools uses them ###############
+#########################################################
+# For each gene:
+# It looks at variants in the VCF within ±1 Mb (cis-window).
+# Reads expression from the BED file for that gene across samples.
+# Tests if genotype dosage (0, 1, 2) correlates with expression values (expression ~ genotype + covariates)
+# Writes results in output tables like:
+#chr   start    end    phenotype_id      variant_id        distance  p_nominal
+1      11868    14412  ENSG00000223972  1_752566_G_A       250000     0.01234
+1      14361    29370  ENSG00000227232  1_762320_C_T       10000      3.5e-06
+
+##results might look different with empirical testing aka there will be info about empirical p-value per gene (corrected for testing many SNPs per gene)
+#chr  start    end      phenotype_id      nsnps   beta   slope   slope_se   pval_nominal_best   pval_perm   pval_beta
+1     11868    14412    ENSG00000223972  183     0.22   0.135   0.023       1.2e-06             0.017        0.019
+1     14361    29370    ENSG00000227232  160     0.44   0.202   0.028       2.6e-09             2.0e-05      2.3e-05
+# chr / start / end	Gene coordinates (from BED).
+# phenotype_id	Gene or transcript ID.
+# nsnps	Number of SNPs tested for that gene.
+# beta	Shape parameter for beta distribution (used to extrapolate p-values).
+# slope	Effect size (β) of the most significant SNP for that gene.
+# slope_se	Standard error of that effect size.
+# pval_nominal_best	Nominal p-value of the top SNP.
+# pval_perm	Empirical p-value after 10,000 permutations (gene-level significance).
+# pval_beta	Beta-approximated permutation p-value (usually used for FDR).
+
+##plot usually have genetype dosage (0, 1, 2) on the x-axis and expression values on the y-axis and each point represent each sample
+
+DIR = /sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022
+
+RESULTS_UPDATED24OCT2022_RNA_QC2CALLSET_nsv29_IDTopVar.txt
+RESULTS_UPDATED03DEC2022_MATURERNA_QC2CALLSET_nsv28_IDTopVar.txt
+
+test<-fread("/sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022/RESULTS_UPDATED03DEC2022_MATURERNA_QC2CALLSET_nsv28_IDTopVar.txt", data.table=FALSE)
+
+head(test)
+#   chr3:27951107[b38]C T
+# 1 chr3:27627875[b38]A G
+# 2 chr3:28253210[b38]C T
+# 3 chr3:28896927[b38]C T
+# 4 chr3:28348860[b38]A G
+
+##### STRATEGY --- this might take a while to run and gotta //
+
+
+### rb statistic to estimate the correlation between estimates which accounts for error of estimates! what are you?
+## estimator: https://www.youtube.com/watch?v=YJRHmv6OpWQ | Stats with Brian
+
+###### downloaded the BrainMeta v2 on https://yanglab.westlake.edu.cn/software/smr/#DataResource and uploaded it to the directory below
+## https://docs.google.com/document/d/10t4XK9f7qJpjH0T1TjDxfEGOHdcC0aDQq-ln_7_G8JQ/edit?tab=t.0
+
+/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+
+BrainMeta_cis_eqtl_summary.tar.gz
+BrainMeta_cis_eqtl_summary
+
+cd /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary
+#for each chromosome, there are 4 files:
+BrainMeta_cis_eQTL_chr10.besd #Binary eQTL summary data showing the compact binary matrix of SNP–gene association statistics (e.g., beta, SE, p-value, sample size).
+BrainMeta_cis_eQTL_chr10.epi #Expression Probe Information, Content: metadata describing each gene or transcript tested in the eQTL analysis 
+BrainMeta_cis_eQTL_chr10.esi #SNP Information, Content: list of all SNPs (variants) tested in the eQTL analysis.     
+BrainMeta_cis_eQTL_chr10.summary #? Text summary statistics, a summary table of eQTL analysis results in plain text format
+
+#if desire, can turn besd files into .txt file
+module load smr/1.4.0
+# Dump ALL stored entries (set a lenient p-thresh) ~~ only 22 chromosomes, no sex chromosome
+smr --beqtl-summary BrainMeta_cis_eQTL_chr22 \
+    --query 1 \
+    --out BrainMeta_cis_eQTL_chr22_dump
+
+sum <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_cis_eQTL_chr10_dump.txt", data.table = FALSE)
+head(sum)
+          SNP Chr    BP A1 A2      Freq             Probe Probe_Chr Probe_bp
+1 rs781902650  10 60403  A  G 0.0136612 ENSG00000261456.6        10   106466
+2 rs782439347  10 60637  G  A 0.0628415 ENSG00000261456.6        10   106466
+3 rs569167217  10 60684  C  A 0.0628415 ENSG00000261456.6        10   106466
+4 rs532801013  10 61283  A  G 0.0114183 ENSG00000261456.6        10   106466
+5 rs548639866  10 61331  G  A 0.0628415 ENSG00000261456.6        10   106466
+6 rs782036520  10 61372  C CA 0.7065970 ENSG00000261456.6        10   106466
+   Gene Orientation         b       SE         p
+1 TUBB8           - -0.144296 0.112159 0.1982580
+2 TUBB8           - -0.118026 0.127103 0.3531020
+3 TUBB8           - -0.118026 0.127103 0.3531020
+4 TUBB8           - -0.138086 0.234169 0.5554030
+5 TUBB8           - -0.140844 0.124429 0.2576640
+6 TUBB8           - -0.178767 0.102514 0.0811885
+
+##C --> CA means insertion of "A" -- These are common in RNA-seq eQTL datasets because indels can be genotyped and tested alongside SNPs.
+
+SNP	The specific genetic variant being tested for association with gene expression.
+Chr	Chromosome of the SNP	
+BP	Base-pair coordinate | Genomic position (typically in hg19/GRCh37).
+A1	Effect allele, The allele whose dosage (0, 1, 2 copies) is used in the regression; the slope (b) refers to this allele.
+A2	Non-effect allele, The other allele at the same locus. May represent the reference or the alternate allele; not necessarily minor.
+Freq	Frequency of A1: Proportion of samples carrying the A1 allele. Values < 0.5 = A1 is minor; > 0.5 = A1 is major.
+Probe	Expression feature ID: The tested RNA-seq feature (Ensembl gene or transcript ID). Called “probe” for historical consistency with microarray eQTLs.
+Probe_Chr	Chromosome of the probe (gene)	
+Probe_bp	Gene start coordinate: Approximate start (TSS) position of the gene or transcript.
+Gene	Gene symbol: Readable HGNC symbol mapped to the Ensembl ID (e.g., TUBB8).
+Orientation	Strand of the gene: “+” = forward strand; “–” = reverse strand.
+b	Effect size (slope):	Change in normalized expression per additional A1 allele. Positive = A1 increases expression; negative = A1 decreases expression.
+SE	Standard error of b:	Sampling uncertainty of the effect estimate.
+p	Nominal p-value: Statistical significance for association between genotype dosage and expression.
+
+dim(sum)
+#12,488,454       14
+
+############ FDR depends on the scope of correction — do you correct within-gene (cis), within-chromosome, or genome-wide?
+# In a full eQTL pipeline (like GTEx, QTLtools, or FastQTL), there are 3 steps to compute a FDR-corrected p-value: 
+# 1. Nominal pass: test every variant–gene pair → produce nominal p-values.
+# 2. Permutation pass: for each gene, shuffle sample labels many times to get an empirical p-value for the best SNP per gene.
+# 3. Across genes: use those best empirical p-values to compute FDR (Benjamini–Hochberg).
+
+############# if desire a global FDR, 
+sum$FDR <- p.adjust(sum$p, method = "BH")
+# This gives you an approximate global FDR.
+# But note that because eQTLs are not independent (LD), this will be conservative compared with permutation-based FDRs
+
+sig <- subset(sum, FDR < 0.05)
+dim(sig) #425,720     15
+head(sig)
+
+
+epi <- read.table("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_cis_eQTL_chr10.epi", header=FALSE)
+head(epi)
+#   V1                 V2 V3      V4         V5 V6
+# 1 10  ENSG00000261456.6  0  106466      TUBB8  -
+# 2 10  ENSG00000276662.1  0  194226 AL713922.2  -
+# 3 10  ENSG00000225140.1  0  675886 AL358216.1  +
+
+esi <- read.table("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_cis_eQTL_chr10.esi", header=FALSE)
+head(esi)
+#   V1          V2 V3    V4 V5 V6        V7
+# 1 10 rs781902650  0 60403  A  G 0.0136612
+# 2 10 rs782439347  0 60637  G  A 0.0628415
+# 3 10 rs569167217  0 60684  C  A 0.0628415
+
+readLines("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_cis_eQTL_chr10.summary", n=15)
+
+summary <- fread(
+  "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_cis_eQTL_chr10.summary",
+  skip = 9,        # skip the first 9 metadata lines
+  header = TRUE,   # line 10 is the header
+  sep = "\t",      # tab-delimited
+  fill = TRUE
+)
+head(summary,3)
+#     {ProbeID, ProbeChr, ProbeBP} [Chr,cis_startBP,cis_endBP,NumSNPs]
+#                           <char>                              <char>
+# 1: {ENSG00000261456.6,10,106466}            [10,60403,2106422,10664]
+# 2: {ENSG00000276662.1,10,194226}            [10,60403,2194223,10958]
+# 3: {ENSG00000225140.1,10,675886}            [10,60403,2674678,15082]
+#    <Chr,trans_startBP,trans_endBP,NumSNPs> (NumSNPs)
+#                                     <char>    <char>
+# 1:                                      <>        ()
+# 2:                                      <>        ()
+# 3:                                      <>        ()
+
+########################
+# Idea — “take eQTLs detected in other datasets and then contrast effect sizes estimated from your two groups” 
+#is an approach for reducing winner’s curse / discovery bias.
+
+# In other words: Don’t do discovery vs replication (where you test significance twice).
+
+# Instead, define a fixed set of SNP–gene pairs (e.g., all known cis-eQTLs from BrainMeta),
+# and then compare estimated betas (b) across your two conditions.
+
+# This is often called an effect-size concordance or context-dependent eQTL (CD-eQTL) analysis.
+
+library(data.table)
+files <- list.files("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/",
+                    pattern = "BrainMeta_cis_eQTL_chr[0-9XY]+_dump.txt",
+                    full.names = TRUE)
+sum_all <- rbindlist(lapply(files, fread), use.names = TRUE, fill = TRUE)
+dim(sum_all)
+#283,666,305        14
+saveRDS(sum_all, "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eQTL_allchr_dump.rds")
+
+sum_all2 <- readRDS("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eQTL_allchr_dump.rds")
+
+all.equal(sum_all, sum_all2) #TRUE
+
+#sum_all = external truth set (defines which eQTLs to examine).
+# Do the same SNP–gene pairs that show eQTL effects in BrainMeta also have similar effect sizes in your Living and Postmortem samples?
+# aka test for consistency, Correlation of β’s (e.g., cor(b_LIV, b_sum_all)), or a scatterplot slope near 1
+
+##And the rb statistic to estimate the correlation between estimates which accounts for error of estimates.
+##https://yanglab.westlake.edu.cn/software/osca/#MeCS
+
+## need to download OSCA to run rb
+##https://yanglab.westlake.edu.cn/software/osca/#Download
+
+#it's here:
+/sc/arion/projects/mscic1/results/jolie/tools/osca/osca-1.20-linux-x86_64
+
+##find LIV and PM eqtl data 
+
+test<-fread("/sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022/RNA/QC2STRICTCALLSET_qtltoolsOutput_1.txt", data.table=FALSE)
+test<-fread("/sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022/RNA/QC2CALLSET_qtltoolsOutput_1.txt", data.table=FALSE)
+
+##they're both funny
+head(test)
+#    ENSG00000165156 8 123275542 123275542 - 3636 838403 chr8:122437139[b38]C
+# 1 ENSG00000253336 8 123288356 123288356 + 3655 -401637 chr8:122886719[b38]C
+# 2 ENSG00000156802 8 123416351 123416351 - 3785 -819984 chr8:124236335[b38]C
+# 3   ENSG00000156795 8 123416726 123416726 + 3788 44272 chr8:123460998[b38]A
+# 4 ENSG00000156804 8 123541207 123541207 - 3777 -880487 chr8:124421694[b38]C
+# 5 ENSG00000176853 8 123768440 123768440 + 4111 -569979 chr8:123198461[b38]C
+# 6  ENSG00000253868 8 124171523 124171523 - 4343 775656 chr8:123395867[b38]A
+#        T 8 122437139 122437139 359 317.491 1.01862 711.247 0.00283616 0.0805533 0.967903 0.970666
+# 1       T 8 122886719 122886719 359 245.06 0.93381 328.537 0.000248439 0.219701 0.576942 0.588459
+# 2       T 8 124236335 124236335 359 310.181 1.03363 673.23 0.00241727 0.0475926 0.957504 0.958438
+# 3 G 8 123460998 123460998 359 312.688 1.00477 670.975 2.46797e-08 0.0856864 0.00019998 0.00012586
+# 4    T 8 124421694 124421694 359 315.773 1.03311 678.885 7.95487e-06 0.322284 0.0154985 0.0163265
+# 5     T 8 123198461 123198461 359 198.835 0.858813 163.952 3.47214e-05 0.233404 0.342966 0.358832
+# 6    G 8 123395867 123395867 359 250.757 0.953652 291.421 0.000102333 -0.641089 0.308469 0.311024
+
+/sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022/
+
+RESULTS_UPDATED03DEC2022_MATURERNA_QC2CALLSET_nsv28_IDTopVar.txt
+RESULTS_UPDATED03DEC2022_PRERNA_QC2CALLSET_nsv30_IDTopVar.txt
+RESULTS_UPDATED03DEC2022_PROTEIN_QC2CALLSET_nsv30_IDTopVar.txt
+
+test<-fread("/sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022/RESULTS_UPDATED03DEC2022_MATURERNA_QC2CALLSET_nsv28_IDTopVar.txt", data.table=FALSE)
+head(test)
+#   chr3:27951107[b38]C T
+# 1 chr3:27627875[b38]A G
+# 2 chr3:28253210[b38]C T
+# 3 chr3:28896927[b38]C T
+# 4 chr3:28348860[b38]A G
+# 5 chr3:28743735[b38]A C
+# 6 chr3:28797154[b38]A G
+
+/sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022/MATURERNA
+
+test<-fread("/sc/arion/projects/psychgen/lbp/results/runEQTL/20OCT2022/MATURERNA/QC2CALLSET_qtltoolsOutput_1.txt", data.table=FALSE)
+head(test)
+#    ENSG00000201033 3 27513872 27513872 + 3251 474480 chr3:27988352[b38]A
+# 1 ENSG00000271943 3 27632943 27632943 + 3104 -858027 chr3:26774916[b38]A
+# 2  ENSG00000187118 3 28241585 28241585 + 3317 390761 chr3:28632346[b38]A
+# 3 ENSG00000163512 3 28348602 28348602 - 3194 -980112 chr3:29328714[b38]C
+# 4     ENSG00000206559 3 28348722 28348722 + 3194 138 chr3:28348860[b38]A
+# 5  ENSG00000283563 3 28349179 28349179 + 3195 394556 chr3:28743735[b38]A
+# 6  ENSG00000144642 3 28574792 28574792 + 3474 489879 chr3:29064671[b38]C
+#       G 3 27988352 27988352 359 221.658 0.912363 167.89 0.000331869 0.406547 0.585141 0.596937
+# 1   C 3 26774916 26774916 359 228.004 0.896835 149.535 5.97201e-05 -0.444766 0.225777 0.230564
+# 2     G 3 28632346 28632346 359 306.062 0.984696 474.125 0.00026663 0.143152 0.307669 0.310882
+# 3        G 3 29328714 29328714 359 318.56 1.04078 569.102 0.00141315 -0.15302 0.768823 0.76511
+# 4 G 3 28348860 28348860 359 300.049 1.03593 464.743 4.77699e-07 0.172639 0.00129987 0.00152464
+# 5   C 3 28743735 28743735 359 123.844 0.819659 64.1329 4.55881e-05 -0.378899 0.714229 0.735749
+# 6 G 3 29064671 29064671 359 286.271 1.02225 466.474 1.89845e-07 0.653324 0.00219978 0.00132223
+
+
+############ LOOKING AT EQTL INPUTS 
+##main files used to run the analysis: 
+/sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/DNA/LIVPM_dna.vcf.gz #genotype info 
+/sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/DNA/LIVPM_mds.txt #COV - this is multidimensional scaling
+
+LIVPM_dna_interaction.vcf.gz      LIVPM_dna.vcf.gz.tbi      LIVPM_mds.txt
+LIVPM_dna_interaction.vcf.gz.tbi  LIVPM_interaction.txt     LIVPM_mds_with_livpm_in_model.txt
+LIVPM_dna_strict.vcf.gz           LIVPM_mds_strict_tsv.txt  LIVPM_strict_interaction.txt
+LIVPM_dna_strict.vcf.gz.tbi       LIVPM_mds_strict.txt
+LIVPM_dna.vcf.gz                  LIVPM_mds_tsv.txt
+
+#zcat LIVPM_dna.vcf.gz | head -n 30 | column -t
+
+##copy relevant files to my path
+cp /sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/DNA/LIVPM_dna.vcf.gz \
+   /sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/DNA/LIVPM_mds.txt \
+   /sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/DNA/LIVPM_dna.vcf.gz.tbi \
+   /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/
+
+## LIVPM_dna.vcf.gz.tbi is the indexed (condensed) version of LIVPM_dna.vcf.gz. look at this size differences!
+ls -lh LIVPM_dna.vcf.gz*
+# -rw-rwxr--+ 1 hoangd02 mscic1 370M Nov 10 14:49 LIVPM_dna.vcf.gz
+# -rw-rwxr--+ 1 hoangd02 mscic1 1.9M Nov 10 15:33 LIVPM_dna.vcf.gz.tbi
+#.tbi tells bcftools where in the compressed file each chromosome’s data starts
+
+# LIVPM_dna.vcf.gz → the standard “QC2CALLSET”, a broadly filtered set of genotypes used for most downstream analyses (e.g., GWAS, eQTLs).
+##### Used for association tests (eQTL, GWAS) when you need maximal coverage
+# LIVPM_dna_strict.vcf.gz → the “QC2STRICTCALLSET”, a tightly filtered subset of higher-confidence genotypes.
+##### Used for benchmarking, imputation reference, validation where false positives are costly.
+
+# QC2CALLSET = “inclusive but noisy.”
+##### Good for eQTL discovery because eQTLs benefit from more variants even if a few are imperfect.
+# QC2STRICTCALLSET = “exclusive but clean.”
+##### Good for validation or reference work where false positives are more dangerous than missed variants.
+
+test<-fread("/sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/DNA/LIVPM_mds.txt", data.table=FALSE)
+dim(test) #10 362
+
+################## ################## ################## ################## ################## ################## 
+####################### NEW GAME PLAN | running eQTL analyses for LIV vs PM separately ########################## 
+################## ################## ################## ################## ################## ################## 
+# My understanding of Dr. Wray's suggestion:
+# 1. Use BrainMeta eQTLs as the "discovery" set (large, well-powered)
+# 2. Extract effect sizes for the same SNP-gene pairs from:
+# 3. Do LIV-only analysis → rb(BrainMeta, LIV)
+# 4. Do PM-only analysis → rb(BrainMeta, PM)
+# 5. Test if rb(BrainMeta, LIV) ≠ rb(BrainMeta, PM)
+#### Alex's suggestion: subset to the snps from brainmeta before running qtltools since we dont care about any other snps
+
+#https://samtools.github.io/bcftools/
+module avail bcftools
+module load bcftools/1.22
+
+bcftools view -h LIVPM_dna.vcf.gz | less # view header and metadata
+
+#https://samtools.github.io/bcftools/howtos/query.html
+bcftools query -l LIVPM_dna.vcf.gz  # list sample IDs
+bcftools query -l LIVPM_dna.vcf.gz | wc -l #number of samples - 361
+
+less vcf_stats.txt
+
+######## Executing Dr.Wray + Alex's suggestions: 
+#Step 1: transfer the files (including the .tbi index files) to my path (see above)
+#/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/
+
+ls -lh LIVPM_dna.vcf.gz*
+# -rw-rwxr--+ 1 hoangd02 mscic1 370M Nov 10 14:49 LIVPM_dna.vcf.gz
+# -rw-rwxr--+ 1 hoangd02 mscic1 1.9M Nov 10 15:33 LIVPM_dna.vcf.gz.tbi
+#.tbi tells bcftools where in the compressed file each chromosome’s data starts
+
+#Step 2: subset our SNP-gene list to those in brainmeta to save computing time!
+###just for curiosity
+brainmeta <- readRDS("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eQTL_allchr_dump.rds")
+##this takes a while to load
+dim(brainmeta) #283,666,305        14
+length(unique(brainmeta$Probe)) #16743 unique genes
+
+########Some issues, brainmeta = hg19, our file is likely hg28 
+zgrep '^##contig' LIVPM_dna.vcf.gz | head
+# In GRCh38, chromosome 1 length ≈ 248,956,422.
+# In GRCh37/hg19, chromosome 1 length ≈ 249,250,621.
+# If you see something like length=248937426 (or close) it’s likely GRCh38.
+
+##also there is a line here, can maybe check in metadata as well
+chr1:701595[b38]A,G
+
+#############a way to convert hg19 --> hg38
+cd /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/
+
+# Download the liftOver binary
+wget http://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/liftOver
+chmod +x liftOver
+
+# Download the chain file
+wget -O hg19ToHg38.over.chain.gz \
+http://hgdownload.cse.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz
+
+##########
+########## creating brainmeta_hg19.bed by adding "chr" in front of the chr numbers
+Rscript -e '
+bm <- readRDS("BrainMeta_cis_eQTL_allchr_dump.rds");
+bed <- data.frame(
+  chr   = paste0("chr", bm$Chr),
+  start = pmax(bm$BP - 1L, 0L),   # 0-based start
+  end   = bm$BP                   # half-open end
+);
+write.table(bed, file="brainmeta_hg19.bed", sep="\t",
+            quote=FALSE, row.names=FALSE, col.names=FALSE)
+'
+##########
+##########
+# Run it directly
+./liftOver brainmeta_hg19.bed hg19ToHg38.over.chain.gz \
+           brainmeta_hg38_chr.bed brainmeta_unmapped.bed
+
+#brainmeta_hg19.bed -- Input BED file with coordinates in hg19.
+#hg19ToHg38.over.chain.gz -- The chain file describing how to map hg19 → hg38 coordinates.
+#brainmeta_hg38_chr.bed -- Output BED file containing successfully lifted coordinates in hg38.
+#brainmeta_unmapped.bed -- Output file containing regions that could not be converted 
+#(liftOver fails for some positions, e.g., deletions, gaps, rearranged regions).
+
+##prints the number of lines in each file
+wc -l brainmeta_hg19.bed brainmeta_hg38_chr.bed brainmeta_unmapped.bed
+
+#   283666305 brainmeta_hg19.bed
+#   283309353 brainmeta_hg38_chr.bed - 99.9% success
+#      713904 brainmeta_unmapped.bed - 0.25% failed
+#   567689562 total
+
+########################check if liftover hg38 is incorporated into the new brainmeta !!!
+
+ls -lh brainmeta*
+-rw-rw-r--+ 1 hoangd02 mscic1 6.3G Nov 10 19:51 brainmeta_hg19.bed   ##input
+-rw-rw-r--+ 1 hoangd02 mscic1 6.3G Nov 10 20:19 brainmeta_hg38_chr.bed ##this has chr, successfully mapped coordinates
+-rw-rw-r--+ 1 hoangd02 mscic1 5.5G Nov 10 15:58 brainmeta_positions.bed ## this doesnt have chr
+-rw-rw-r--+ 1 hoangd02 mscic1  14M Nov 10 20:19 brainmeta_unmapped.bed # any that failed (different build, gaps, etc.)
+
+head brainmeta_hg19.bed
+# chr1	10389	10390
+# chr1	10396	10397
+
+head brainmeta_hg38_chr.bed
+# chr1	10389	10390
+# chr1	10396	10397
+
+head brainmeta_positions.bed
+# 1	10390	10390
+# 1	10397	10397
+
+head brainmeta_unmapped.bed
+#Deleted in new
+#chr1	1566067	1566068
+#Deleted in new
+#chr1	1581557	1581558
+
+##stripping the prefix cuz my VCF uses numeric chrom labels (e.g., 1, not chr1):
+sed -E 's/^chr//' brainmeta_hg38_chr.bed > brainmeta_positions_hg38.bed
+head brainmeta_positions_hg38.bed
+# e.g., "1   701594   701595"  (remember: these are 0-based half-open intervals)
+
+##now subset to only variants that fall within the genomic positions listed in this BED file
+bcftools view -R brainmeta_positions_hg38.bed -Oz -o LIVPM_brainmeta.vcf.gz LIVPM_dna.vcf.gz
+
+#LIVPM_brainmeta.vcf.gz contained filtered results
+#LIVPM_dna.vcf.gz input file that contains genotypes for all LIV and PM samples
+
+ls -lh LIVPM*
+-rw-rw-r--+ 1 hoangd02 mscic1 358M Nov 10 21:11 LIVPM_brainmeta.vcf.gz
+-rw-rw-r--+ 1 hoangd02 mscic1 1.9M Nov 10 21:12 LIVPM_brainmeta.vcf.gz.tbi
+-rw-rwxr--+ 1 hoangd02 mscic1 370M Nov 10 14:49 LIVPM_dna.vcf.gz
+-rw-rwxr--+ 1 hoangd02 mscic1 1.9M Nov 10 16:26 LIVPM_dna.vcf.gz.tbi
+-rw-rwxr--+ 1 hoangd02 mscic1  41K Nov 10 14:49 LIVPM_mds.txt
+
+##OG file
+bcftools index -n LIVPM_dna.vcf.gz #5,136,250 variants
+
+#new files
+bcftools index -t LIVPM_brainmeta.vcf.gz #create a .tbi
+bcftools index -n LIVPM_brainmeta.vcf.gz  #number of variants - 4,868,774
+bcftools query -l LIVPM_brainmeta.vcf.gz | wc -l   #number of samples - 361
+
+zcat LIVPM_brainmeta.vcf.gz | grep -v "^#" | head
+
+
+#Step 3: make LIV only and PM only files!
+# All sample IDs (keep for column order later)
+bcftools query -l LIVPM_brainmeta.vcf.gz > all_samples.txt
+
+# Living = sample IDs starting with "PT-"
+grep '^PT-' all_samples.txt > liv_samples.txt
+
+# Postmortem = everything else
+grep -v '^PT-' all_samples.txt > pm_samples.txt
+
+# Confirm no missing or extra samples:
+comm -23 <(sort liv_samples.txt) <(sort all_samples.txt) # any in LIV not in VCF
+comm -23 <(sort pm_samples.txt)  <(sort all_samples.txt) # any in PM not in VCF
+
+wc -l liv_samples.txt
+wc -l pm_samples.txt
+
+# 160 liv_samples.txt
+# 201 pm_samples.txt
+
+#(Recommended) Create per-group VCFs and index
+bcftools view -S liv_samples.txt --force-samples -Oz -o LIV_only.vcf.gz LIVPM_brainmeta.vcf.gz
+bcftools index -t LIV_only.vcf.gz
+
+bcftools view -S pm_samples.txt  --force-samples -Oz -o PM_only.vcf.gz  LIVPM_brainmeta.vcf.gz
+bcftools index -t PM_only.vcf.gz
+
+#Save the exact sample order (use this to reorder expression/covariates):
+bcftools query -l LIV_only.vcf.gz > liv_order.txt
+bcftools query -l PM_only.vcf.gz  > pm_order.txt
+
+##Reorder your expression matrices to match each group’s order
+
+##now that you have the LIV and PM genotype separately, have to separate out expression (dependent variable) and covariates!!!
+################ COVARIATES ################
+#############################################
+#question for alex -- to recompute PCs separately per group or not? gpt said no
+
+#just need to transpose the covars matrix and subset for LIV and PM
+library(data.table)
+
+# Read
+cov <- fread("/sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/DNA/LIVPM_mds.txt", data.table=FALSE)
+
+# Transpose and fix header
+cov_t <- as.data.frame(t(cov[,-1]))  # transpose everything except the first column (the "id" row labels)
+colnames(cov_t) <- cov$id            # set PC1–PC10 as column names
+cov_t$ID <- rownames(cov_t)          # move sample IDs into a column
+cov_t <- cov_t[, c("ID", setdiff(names(cov_t), "ID"))]
+
+# Sanity check
+head(cov_t)
+
+liv_ids <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/liv_order.txt", header=FALSE)$V1
+pm_ids  <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/pm_order.txt", header=FALSE)$V1
+
+LIV_cov <- cov_t[cov_t$ID %in% liv_ids, ]
+PM_cov  <- cov_t[cov_t$ID %in% pm_ids, ]
+
+# Reorder to match VCF order
+LIV_cov <- LIV_cov[match(liv_ids, LIV_cov$ID), ]
+PM_cov  <- PM_cov[match(pm_ids,  PM_cov$ID), ]
+
+# Save out
+fwrite(LIV_cov, "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/LIV_mds.txt", sep="\t", quote=FALSE)
+fwrite(PM_cov,  "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/PM_mds.txt",  sep="\t", quote=FALSE)
+
+# Extract first 10 sample IDs from VCF and cov file to see if the order match and it does!
+bcftools query -l LIVPM_brainmeta.vcf.gz | head
+head -n 11 /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/LIV_mds.txt | cut -f1
+
+################ EXPRESSION ################
+#############################################
+/sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/MATURERNA/
+
+/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split
+
+#for each nsv, 1 to 30, these are the outputs: 
+QC2CALLSET_nsv8.bed
+QC2CALLSET_nsv8.bed.gz
+QC2CALLSET_nsv8.bed.gz.tbi
+QC2CALLSET_nsv8.fastqtl.bed.gz
+QC2CALLSET_nsv8.fastqtl.bed.gz.tbi
+
+zcat /sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/MATURERNA/QC2CALLSET_nsv10.bed.gz | head -n 2
+
+zcat QC2CALLSET_nsv8.bed.gz | head
+#Chr start end	pid	            gid	         strand	S13973	S15372	S16676	T-4283	S12988	T-4207	T-306	S05537	T-3999	HBGM-17-001-FC	S02413	T-4254	T-5373	S18920	T-4414	HctZZW-17-004-FC	T-1976	T-248	T-165	T-127	T-143	T-2017	S06984	T-296	T-130	T-243	T-4174	S10626	S11820	S11891	T-159	S04892	T-3922	T-102	S09511	T-155	T-325	T-220	S12808	S17042	T-563	S08841	T-233	S14518	S16891	S05845	T-217	T-5320	T-4815	T-301	T-3431	T-5282	T-4107	S09532	Hct15HAL-17-003-FC	S10171	Hct15HBF-17-001-FC	T-4097	S12782	T-202	S05842	T-227	T-268	T-108	T-274	T-230	T-158	T-190	T-4521	T-3966	S14356	T-5354	S17680	S12147	T-131	S16215	S10228	T-4839	S12658	T-164	T-4452	T-4685	T-134	T-4915	T-779	S10096	T-251	HBJE-17-001-FC	T-124	S15419	T-290	S03675	T-4163	T-257	HBHV-17-001-FC	S14373	T-4924	T-777	T-781	T-156	T-4542	S16580	T-4051	S18586	T-2467	T-5258	T-3940	T-339	S16602	T-147	T-3799	T-1954	S19335	S06194	T-4188	T-145	T-5360	S12227	S04859	S11088	S15709	T-5259	S09277	T-780	T-4208	S16177	T-174	T-346	S19433	T-52	S01462	S08434	T-351	HBDK-17-002-FC	HBIE-17-001-FC	S14193	S13464	S16465	T-3890	T-169	T-4102	S12025	T-176	T-4297	T-4518	T-4561	T-4639	T-4210	T-256	T-167	T-4108	S14836	T-69	S08041	T-111	S13050	T-136	T-9	S10048	T-206	T-219	T-148	S00021	T-5293	S16738	S05527	T-180	T-132	S11641	T-4345	S16036	S19871	T-2011	S16857	T-502	T-3939	T-4232	T-168	Hct15HBU-17-001-FC	T-2791	T-2465	T-139	S04353	T-107	S11818	Hct15HAG-17-001-FC	T-5303	T-2007	T-4284	T-198	S09063	S12545	T-189	T-133	T-362	S14286	T-81	T-16	T-319	T-259	S05678	PT-0106	PT-0046	PT-0188	PT-0019	PT-0006	PT-0080	PT-0045	PT-0115PT-0186	PT-0001	PT-0103	PT-0131	PT-0140	PT-0025	PT-0155	PT-0146	PT-0032	PT-0064PT-0083	PT-0015	PT-0194	PT-0004	PT-0079	PT-0148	PT-0196	PT-0090	PT-0095	PT-0054PT-0187	PT-0149	PT-0062	PT-0039	PT-0189	PT-0116	PT-0098	PT-0133	PT-0130	PT-0005PT-0117	PT-0070	PT-0016	PT-0177	PT-0071	PT-0171	PT-0173	PT-0058	PT-0150	PT-0099PT-0190	PT-0002	PT-0036	PT-0144	PT-0037	PT-0074	PT-0124	PT-0100	PT-0165	PT-0191PT-0010	PT-0060	PT-0161	PT-0020	PT-0101	PT-0193	PT-0027	PT-0139	PT-0162	PT-0114PT-0175	PT-0160	PT-0031	PT-0013	PT-0102	PT-0092	PT-0082	PT-0093	PT-0172	PT-0061PT-0178	PT-0180	PT-0018	PT-0087	PT-0052	PT-0056	PT-0163	PT-0174	PT-0041	PT-0132PT-0143	PT-0022	PT-0112	PT-0111	PT-0125	PT-0097	PT-0192	PT-0135	PT-0157	PT-0170PT-0029	PT-0120	PT-0059	PT-0030	PT-0145	PT-0158	PT-0047	PT-0134	PT-0084	PT-0049PT-0110	PT-0038	PT-0044	PT-0081	PT-0094	PT-0072	PT-0086	PT-0033	PT-0181	PT-0076PT-0198	PT-0105	PT-0024	PT-0113	PT-0088	PT-0073	PT-0085	PT-0040	PT-0023	PT-0034PT-0152	PT-0126	PT-0119	PT-0057	PT-0159	PT-0012	PT-0035	PT-0121	PT-0065	PT-0169PT-0011	PT-0104	PT-0042	PT-0183	PT-0091	PT-0136	PT-0021	PT-0048	PT-0138	PT-0089PT-0123	PT-0109	PT-0051	PT-0055	PT-0142	PT-0009	PT-0069	PT-0026	PT-0147	PT-0028PT-0127	PT-0156
+#1	29534	29535	ENSG00000227232	ENSG00000227232	-	-0.0313373337415247	-0.584902713968715	0.264563750044057	-0.867460353024534	-0.0226332943131393	0.936464297401261	-0.0187809322632575	0.279626427835627	-0.670591620775472	0.262137188065389	-0.583836672294349	-0.00442334452788329	0.59357785971211	-0.0557866554597921	-0.0316059565575011	0.0591050928692587	-0.534001989132534	0.396398484014888	-0.116532499801731	0.291484964397567	0.245473266340103	0.398120456979414	0.460856173332182	0.363980085587457	-0.00587835488866229	-0.275290116983391	0.270068486921668	0.0847023605490369	-0.0364434442010564	-0.450903788904183	0.274188085582197	0.321206878961389	-0.99677853430913	-0.834121833879891	-0.571486157064469	-0.358549782180269	0.470212994626935	0.437392225700005	-0.228214308566096	-0.278221173383665	0.593834112402409	-0.578334877256386	-0.31707630525046	0.354042555255432	-6.31512989794913e-05	0.261294887183626	0.149666309498937	0.0719542874826742	0.132909793965783	0.185168315365555	-0.258080290425099	-0.342351447632576	-0.205389967329586	-0.491150664895275	-0.668770271296908	-0.852846627475016	0.317210166029737	0.0471114620598701	-0.0469006403919443	-0.390269892083904	-0.313872348870283	-0.792091793167993	0.139694196467095	-0.0945351957500262	0.124796459260994	0.584953754375901	-0.795718051520634	-0.0740205196957646	0.4589374451933	-0.063300850977478	-0.0774591893121446	0.05583291548488	0.309479393095944	0.0476592030613156	-0.537533989768647	-0.38283527614349	0.549967211137644	0.360111652099339	-0.0673746570138356	0.0111825887050491	-0.311847102540253	0.451161419317016	-0.346859396298822	0.0107659293594433	0.540258732092287	-0.269413501442332	0.119134799397929	-0.437142978687768	0.781525283165426	0.292266368531325	-0.787280975591213	0.350035118299259	0.203310442910422	1.25895379672503	0.147787959311959	0.256916749848108	0.195840481285895	-0.227399441126828	-0.141498911084154	0.281805536619514	-0.247623312445348	-0.260446759474668	-0.405899334457995	0.12978800838662	-0.0579996242588043	0.627433745772683	0.565689367991163	-0.121822234894521	0.0979935880233065	-0.113650530681542	0.0575053559868113	0.0609026588016144	0.56118735475063	0.255642666480783	-0.479940370558777	-0.0307949118573716	-0.246445738694317	0.295362555570483	0.860915115620546	-0.241548921452761	0.36799629429287
+
+#start: Start coordinate of the region
+#end: Ending coordinate of the region 
+#pid: probe or transcript ID
+#gid: gene ID (often redundant with pid)
+#Strand: strand orientation (+ or -) | + is 5' --> 3' and - is reverse
+#S13973	S15372	S16676	T-4283....: sample ID
+
+## GOAL: Split this into LIV and PM-specific expression files 
+############# TRY 1 - X: falied
+cd /sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+nano split_bed_all_nsv.sh
+
+### TRY 2 - tried nsv 10 
+# --- inputs ---
+SRC=/sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/MATURERNA/QC2CALLSET_nsv10.bed.gz
+OUTDIR=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split
+LIV=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/liv_samples.txt
+PM=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/pm_samples.txt
+mkdir -p "$OUTDIR/tmp"
+
+# 0) de-CRLF and remove empties in sample lists (prevents silent mismatches)
+tr -d '\r' < "$LIV" | awk 'NF' | sort -u > "$OUTDIR/tmp/liv.clean"
+tr -d '\r' < "$PM"  | awk 'NF' | sort -u > "$OUTDIR/tmp/pm.clean"
+
+# 1) header → name→column map (columns are 1-based; samples start at col 7)
+zcat "$SRC" | head -n1 | tr '\t' '\n' | nl -ba > "$OUTDIR/tmp/header.nl"
+# Validate first 6 fields are the fixed BED columns
+awk 'NR==1{if($2!="#Chr"){print "BAD header col1"; exit 1}} 
+     NR==2{if($2!="start"){print "BAD header col2"; exit 1}}
+     NR==3{if($2!="end"){print "BAD header col3"; exit 1}}
+     NR==4{if($2!="pid"){print "BAD header col4"; exit 1}}
+     NR==5{if($2!="gid"){print "BAD header col5"; exit 1}}
+     NR==6{if($2!="strand"){print "BAD header col6"; exit 1}}' "$OUTDIR/tmp/header.nl" || exit 1
+
+# 2) Build exact index lists for LIV and PM in SOURCE ORDER
+# name2col.tsv: <sample>\t<col_index>
+awk 'NR>6{print $2"\t"$1}' "$OUTDIR/tmp/header.nl" > "$OUTDIR/tmp/name2col.tsv"
+
+# collect indices present in header for your clean lists
+awk 'FNR==NR{h[$1]=1; next} ($1 in h){print $2}' "$OUTDIR/tmp/liv.clean" "$OUTDIR/tmp/name2col.tsv" | sort -n > "$OUTDIR/tmp/liv.idx"
+awk 'FNR==NR{h[$1]=1; next} ($1 in h){print $2}' "$OUTDIR/tmp/pm.clean"  "$OUTDIR/tmp/name2col.tsv" | sort -n > "$OUTDIR/tmp/pm.idx"
+
+# diagnostics: which requested names are missing from the header?
+echo "LIV names missing from header:"
+comm -23 <(sort "$OUTDIR/tmp/liv.clean") <(cut -f1 "$OUTDIR/tmp/name2col.tsv" | sort) | head
+echo "PM names missing from header:"
+comm -23 <(sort "$OUTDIR/tmp/pm.clean")  <(cut -f1 "$OUTDIR/tmp/name2col.tsv" | sort) | head
+
+# 3) Emit split files with correct header + rows using awk (keeps tabs intact)
+awk -v OFS='\t' -v LIVIDX="$OUTDIR/tmp/liv.idx" -v PMIDX="$OUTDIR/tmp/pm.idx" '
+  BEGIN{
+    while((getline < LIVIDX)>0){liv[$1]=1; liv_n++; liv_ord[++li]=$1}
+    close(LIVIDX)
+    while((getline < PMIDX)>0){pm[$1]=1; pm_n++; pm_ord[++pi]=$1}
+    close(PMIDX)
+  }
+  NR==1{
+    # print headers
+    printf("#Chr\tstart\tend\tpid\tgid\tstrand") > "'"$OUTDIR"'/QC2CALLSET_nsv10.LIV.bed"
+    for(i=1;i<=li;i++) printf("\t%s", $liv_ord[i]) > "'"$OUTDIR"'/QC2CALLSET_nsv10.LIV.bed"
+    printf("\n") > "'"$OUTDIR"'/QC2CALLSET_nsv10.LIV.bed"
+
+    printf("#Chr\tstart\tend\tpid\tgid\tstrand") > "'"$OUTDIR"'/QC2CALLSET_nsv10.PM.bed"
+    for(i=1;i<=pi;i++) printf("\t%s", $pm_ord[i]) > "'"$OUTDIR"'/QC2CALLSET_nsv10.PM.bed"
+    printf("\n") > "'"$OUTDIR"'/QC2CALLSET_nsv10.PM.bed"
+    next
+  }
+  {
+    # write rows
+    # core 6 columns
+    core=$1 OFS $2 OFS $3 OFS $4 OFS $5 OFS $6
+
+    # LIV row
+    line=core
+    for(i=1;i<=li;i++){ c=liv_ord[i]; line=line OFS $c }
+    print line >> "'"$OUTDIR"'/QC2CALLSET_nsv10.LIV.bed"
+
+    # PM row
+    line=core
+    for(i=1;i<=pi;i++){ c=pm_ord[i]; line=line OFS $c }
+    print line >> "'"$OUTDIR"'/QC2CALLSET_nsv10.PM.bed"
+  }
+' <(zcat "$SRC")
+
+# 4) bgzip + tabix
+bgzip -f "$OUTDIR/QC2CALLSET_nsv10.LIV.bed"
+bgzip -f "$OUTDIR/QC2CALLSET_nsv10.PM.bed"
+tabix -f -p bed "$OUTDIR/QC2CALLSET_nsv10.LIV.bed.gz"
+tabix -f -p bed "$OUTDIR/QC2CALLSET_nsv10.PM.bed.gz"
+
+# 5) sanity checks
+echo "Header counts:"
+echo -n "LIV: "; zcat "$OUTDIR/QC2CALLSET_nsv10.LIV.bed.gz" | head -n1 | awk -F'\t' '{print NF-6}'
+echo -n "PM : "; zcat "$OUTDIR/QC2CALLSET_nsv10.PM.bed.gz"  | head -n1 | awk -F'\t' '{print NF-6}'
+echo "Line counts (must equal source):"
+zcat "$SRC" | wc -l
+zcat "$OUTDIR/QC2CALLSET_nsv10.LIV.bed.gz" | wc -l
+zcat "$OUTDIR/QC2CALLSET_nsv10.PM.bed.gz"  | wc -l
+
+# No PT- in PM header, and all PT- in LIV header
+echo "PT- found in PM header (should be 0):"
+zcat "$OUTDIR/QC2CALLSET_nsv10.PM.bed.gz"  | head -n1 | tr "\t" "\n" | grep -c '^PT-'
+echo "Non-PT found in LIV header (should be 0):"
+zcat "$OUTDIR/QC2CALLSET_nsv10.LIV.bed.gz" | head -n1 | tr "\t" "\n" | awk 'NR>6' | grep -vc '^PT-'
+
+zcat /sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/MATURERNA/QC2CALLSET_nsv8.bed.gz | head -n 2
+zcat /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split/QC2CALLSET_nsv10.LIV.bed.gz | head -n 5
+zcat /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split/QC2CALLSET_nsv10.PM.bed.gz | head -n 5
+
+##seems good, now do all nsv 
+OUTDIR=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split
+INDIR=/sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/MATURERNA
+LIV=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/liv_samples.txt
+PM=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/pm_samples.txt
+mkdir -p "$OUTDIR/tmp"
+
+# clean lists
+tr -d '\r' < "$LIV" | awk 'NF' | sort -u > "$OUTDIR/tmp/liv.clean"
+tr -d '\r' < "$PM"  | awk 'NF' | sort -u > "$OUTDIR/tmp/pm.clean"
+
+for n in $(seq 1 30); do
+  SRC="${INDIR}/QC2CALLSET_nsv${n}.bed.gz"
+  echo "Processing NSV${n}..."
+  if [[ ! -f "$SRC" ]]; then echo "Missing $SRC, skipping"; continue; fi
+
+  zcat "$SRC" | head -n1 | tr '\t' '\n' | nl -ba > "$OUTDIR/tmp/header.nl"
+  awk 'NR>6{print $2"\t"$1}' "$OUTDIR/tmp/header.nl" > "$OUTDIR/tmp/name2col.tsv"
+  awk 'FNR==NR{h[$1]=1; next} ($1 in h){print $2}' "$OUTDIR/tmp/liv.clean" "$OUTDIR/tmp/name2col.tsv" | sort -n > "$OUTDIR/tmp/liv.idx"
+  awk 'FNR==NR{h[$1]=1; next} ($1 in h){print $2}' "$OUTDIR/tmp/pm.clean"  "$OUTDIR/tmp/name2col.tsv" | sort -n > "$OUTDIR/tmp/pm.idx"
+
+  awk -v OFS='\t' -v LIVIDX="$OUTDIR/tmp/liv.idx" -v PMIDX="$OUTDIR/tmp/pm.idx" '
+    BEGIN{
+      while((getline < LIVIDX)>0){liv[$1]=1; liv_ord[++li]=$1}
+      close(LIVIDX)
+      while((getline < PMIDX)>0){pm[$1]=1; pm_ord[++pi]=$1}
+      close(PMIDX)
+    }
+    NR==1{
+      printf("#Chr\tstart\tend\tpid\tgid\tstrand") > "'"$OUTDIR"'/QC2CALLSET_nsv'${n}'.LIV.bed"
+      for(i=1;i<=li;i++) printf("\t%s", $liv_ord[i]) > "'"$OUTDIR"'/QC2CALLSET_nsv'${n}'.LIV.bed"
+      printf("\n") > "'"$OUTDIR"'/QC2CALLSET_nsv'${n}'.LIV.bed"
+      printf("#Chr\tstart\tend\tpid\tgid\tstrand") > "'"$OUTDIR"'/QC2CALLSET_nsv'${n}'.PM.bed"
+      for(i=1;i<=pi;i++) printf("\t%s", $pm_ord[i]) > "'"$OUTDIR"'/QC2CALLSET_nsv'${n}'.PM.bed"
+      printf("\n") > "'"$OUTDIR"'/QC2CALLSET_nsv'${n}'.PM.bed"
+      next
+    }
+    {
+      core=$1 OFS $2 OFS $3 OFS $4 OFS $5 OFS $6
+      line=core; for(i=1;i<=li;i++){c=liv_ord[i]; line=line OFS $c} 
+      print line >> "'"$OUTDIR"'/QC2CALLSET_nsv'${n}'.LIV.bed"
+      line=core; for(i=1;i<=pi;i++){c=pm_ord[i]; line=line OFS $c}
+      print line >> "'"$OUTDIR"'/QC2CALLSET_nsv'${n}'.PM.bed"
+    }' <(zcat "$SRC")
+
+  bgzip -f "$OUTDIR/QC2CALLSET_nsv${n}.LIV.bed"
+  bgzip -f "$OUTDIR/QC2CALLSET_nsv${n}.PM.bed"
+  tabix -f -p bed "$OUTDIR/QC2CALLSET_nsv${n}.LIV.bed.gz"
+  tabix -f -p bed "$OUTDIR/QC2CALLSET_nsv${n}.PM.bed.gz"
+
+  echo "✓ Done NSV${n}"
+done
+
+zcat /sc/arion/projects/psychgen/lbp/data/runEQTL/20OCT2022/MATURERNA/QC2CALLSET_nsv8.bed.gz | head -n 2
+zcat /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split/QC2CALLSET_nsv11.LIV.bed.gz | head -n 5
+zcat /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split/QC2CALLSET_nsv11.PM.bed.gz | head -n 5
+
+## looks good
+#checking how many samples
+
+OUTDIR=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split
+
+for f in $OUTDIR/QC2CALLSET_nsv*.bed.gz; do
+  echo -n "$(basename $f): "
+  zcat "$f" | head -n1 | awk -F'\t' '{print NF-6 " samples"}'
+done
+
+ls -lh #this looks more correct
+-rw-rw-r--+ 1 hoangd02 mscic1  41M Nov 11 12:19 QC2CALLSET_nsv9.LIV.bed.gz
+-rw-rw-r--+ 1 hoangd02 mscic1 263K Nov 11 12:19 QC2CALLSET_nsv9.LIV.bed.gz.tbi
+-rw-rw-r--+ 1 hoangd02 mscic1  52M Nov 11 12:19 QC2CALLSET_nsv9.PM.bed.gz
+-rw-rw-r--+ 1 hoangd02 mscic1 265K Nov 11 12:19 QC2CALLSET_nsv9.PM.bed.gz.tbi
+
+######################okay now that we have the LIV/PM genotype, covariates, and expression files ready
+#1) Make sure sample orders match (VCF ↔ BED ↔ COV) before running qtltools ~~~
+# Paths (adjust if yours differ)
+EQTL=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+BEDDIR=$EQTL/MATURERNA_split
+VCF_LIV=$EQTL/LIV_only.vcf.gz
+VCF_PM=$EQTL/PM_only.vcf.gz
+COV_LIV=$EQTL/LIV_mds.txt
+COV_PM=$EQTL/PM_mds.txt
+
+# Extract sample order
+bcftools query -l $VCF_LIV > $EQTL/_order.vcf.LIV
+bcftools query -l $VCF_PM  > $EQTL/_order.vcf.PM
+zcat $BEDDIR/QC2CALLSET_nsv10.LIV.bed.gz | head -n1 | cut -f7- | tr '\t' '\n' > $EQTL/_order.bed.LIV
+zcat $BEDDIR/QC2CALLSET_nsv10.PM.bed.gz  | head -n1 | cut -f7- | tr '\t' '\n' > $EQTL/_order.bed.PM
+head -n1 $COV_LIV | tr '\t' '\n' | tail -n +2 > $EQTL/_order.cov.LIV
+head -n1 $COV_PM  | tr '\t' '\n' | tail -n +2 > $EQTL/_order.cov.PM
+
+# Quick equality checks (should all print 0 differing lines)
+diff $EQTL/_order.vcf.LIV $EQTL/_order.bed.LIV | wc -l
+diff $EQTL/_order.vcf.LIV $EQTL/_order.cov.LIV | wc -l
+diff $EQTL/_order.vcf.PM  $EQTL/_order.bed.PM  | wc -l
+diff $EQTL/_order.vcf.PM  $EQTL/_order.cov.PM  | wc -l
+
+###################### REORDERING LIV and PM 
+eqtl_dir <- "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl"
+ord_liv <- fread(file.path(eqtl_dir, "_order.vcf.LIV"), header = FALSE)$V1
+##
+ord_pm <- fread(file.path(eqtl_dir, "_order.vcf.PM"), header = FALSE)$V1
+mat_dir <- "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split"
+nsvs    <- 1:30  # nsv1..30
+
+for (n in nsvs) {
+  in_file  <- file.path(mat_dir, sprintf("QC2CALLSET_nsv%d.PM.bed.gz", n))
+  out_file <- file.path(mat_dir, sprintf("QC2CALLSET_nsv%d.PM.reordered.bed", n))
+
+  cat("Reordering PM nsv", n, "from", in_file, "...\n")
+
+  bed <- fread(in_file)
+
+  fixed_cols    <- colnames(bed)[1:6]
+  bed_reordered <- bed[, c(fixed_cols, ord_pm), with = FALSE]
+
+  fwrite(bed_reordered, out_file, sep = "\t")
+}
+## QUICK CHECK
+for (n in nsvs) {
+  f <- file.path(mat_dir, sprintf("QC2CALLSET_nsv%d.PM.reordered.bed", n))
+  hdr <- fread(f, nrows = 0)
+
+  ok <- identical(colnames(hdr)[7:ncol(hdr)], ord_pm)
+  cat("PM nsv", n, "- order matches ord_pm? ", ok, "\n")
+}
+#should return TRUE for all
+
+QC2CALLSET_nsv9.LIV.bed.gz
+QC2CALLSET_nsv9.LIV.bed.gz.tbi
+QC2CALLSET_nsv9.LIV.reordered.bed
+QC2CALLSET_nsv9.PM.bed.gz
+QC2CALLSET_nsv9.PM.bed.gz.tbi
+QC2CALLSET_nsv9.PM.reordered.bed
+
+#######################compress and index 
+module load htslib
+module load samtools
+cd /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/MATURERNA_split
+
+for n in {1..30}; do
+  for group in LIV PM; do
+    in="QC2CALLSET_nsv${n}.${group}.reordered.bed"
+    out="${in}.gz"
+
+    echo "Compressing and indexing $in ..."
+    bgzip -f "$in"
+    tabix -f -p bed "$out"
+  done
+done
+
+###################quick sanity check the order of one nsv: 
+zcat QC2CALLSET_nsv9.LIV.reordered.bed.gz | head -n1 | awk -F'\t' '{print NF-6}'
+zcat QC2CALLSET_nsv9.PM.reordered.bed.gz  | head -n1 | awk -F'\t' '{print NF-6}'
+
+QC2CALLSET_nsv9.LIV.bed.gz
+QC2CALLSET_nsv9.LIV.bed.gz.tbi
+QC2CALLSET_nsv9.LIV.reordered.bed.gz
+QC2CALLSET_nsv9.LIV.reordered.bed.gz.tbi
+QC2CALLSET_nsv9.PM.bed.gz
+QC2CALLSET_nsv9.PM.bed.gz.tbi
+QC2CALLSET_nsv9.PM.reordered.bed.gz
+QC2CALLSET_nsv9.PM.reordered.bed.gz.tbi
+
+######################okay now that we have the LIV/PM genotype, covariates, and expression files ready
+#1) Make sure sample orders match (VCF ↔ BED ↔ COV) before running qtltools ~~~
+# Paths (adjust if yours differ)
+EQTL=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+BEDDIR=$EQTL/MATURERNA_split
+VCF_LIV=$EQTL/LIV_only.vcf.gz
+VCF_PM=$EQTL/PM_only.vcf.gz
+COV_LIV=$EQTL/LIV_mds.qtltools.txt            #LIV_mds.txt
+COV_PM=$EQTL/PM_mds.qtltools.txt              #PM_mds.txt
+
+# Extract sample order
+bcftools query -l $VCF_LIV > $EQTL/_order.vcf.LIV
+bcftools query -l $VCF_PM  > $EQTL/_order.vcf.PM
+zcat $BEDDIR/QC2CALLSET_nsv10.LIV.reordered.bed.gz | head -n1 | cut -f7- | tr '\t' '\n' > $EQTL/_order.bed.LIV
+zcat $BEDDIR/QC2CALLSET_nsv10.PM.reordered.bed.gz  | head -n1 | cut -f7- | tr '\t' '\n' > $EQTL/_order.bed.PM
+head -n1 $COV_LIV | tr '\t' '\n' | tail -n +2 > $EQTL/_order.cov.LIV
+head -n1 $COV_PM  | tr '\t' '\n' | tail -n +2 > $EQTL/_order.cov.PM
+
+# Quick equality checks (should all print 0 differing lines)
+diff $EQTL/_order.vcf.LIV $EQTL/_order.bed.LIV | wc -l #0
+diff $EQTL/_order.vcf.LIV $EQTL/_order.cov.LIV | wc -l #0 now, was 172 LIV_mds.txt
+diff $EQTL/_order.vcf.PM  $EQTL/_order.bed.PM  | wc -l #0
+diff $EQTL/_order.vcf.PM  $EQTL/_order.cov.PM  | wc -l #0 now, was 213 PM_mds.txt
+
+######changing the orientation of the LIV and PM covariates file 
+EQTL <- "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl"
+
+##################LIV file: 
+cov<-fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/LIV_mds.txt", data.table=FALSE)
+vcf_order <- scan(file.path(EQTL, "_order.vcf.LIV"), what="character")
+cov <- cov[match(vcf_order, cov$ID), ]
+stopifnot(identical(cov$ID, vcf_order))
+
+#just transposing 
+pcs <- cov[, -1]                      # remove ID column
+rownames(pcs) <- cov$ID               # set rownames = sample IDs
+
+# transpose
+pcs_t <- t(pcs)                       # now rows = PCs, columns = samples
+
+# build final covariate table for QTLtools
+cov_t <- data.table(id = rownames(pcs_t), pcs_t)
+
+# set column names
+setnames(cov_t, c("id", vcf_order))
+head(cov_t)
+
+fwrite(cov_t,
+       file.path(EQTL, "LIV_mds.qtltools.txt"),
+       sep="\t", quote=FALSE)
+
+#############do the same for PM file
+cov<-fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/PM_mds.txt", data.table=FALSE)
+vcf_order <- scan(file.path(EQTL, "_order.vcf.PM"), what="character")
+cov <- cov[match(vcf_order, cov$ID), ]
+stopifnot(identical(cov$ID, vcf_order))
+
+#just transposing 
+pcs <- cov[, -1]                      # remove ID column
+rownames(pcs) <- cov$ID               # set rownames = sample IDs
+
+# transpose
+pcs_t <- t(pcs)                       # now rows = PCs, columns = samples
+
+# build final covariate table for QTLtools
+cov_t <- data.table(id = rownames(pcs_t), pcs_t)
+
+# set column names
+setnames(cov_t, c("id", vcf_order))
+head(cov_t)
+
+fwrite(cov_t,
+       file.path(EQTL, "PM_mds.qtltools.txt"),
+       sep="\t", quote=FALSE)
+
+################ the FINAL files: 
+EQTL=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+BEDDIR=$EQTL/MATURERNA_split ##expression files
+VCF_LIV=$EQTL/LIV_only.vcf.gz ##genotype file 
+VCF_PM=$EQTL/PM_only.vcf.gz ##genotype file 
+COV_LIV=$EQTL/LIV_mds.qtltools.txt ##covariate file           
+COV_PM=$EQTL/PM_mds.qtltools.txt ##covariate file           
+
+# Extract sample order
+bcftools query -l $VCF_LIV > $EQTL/_order.vcf.LIV
+bcftools query -l $VCF_PM  > $EQTL/_order.vcf.PM
+zcat $BEDDIR/QC2CALLSET_nsv10.LIV.reordered.bed.gz | head -n1 | cut -f7- | tr '\t' '\n' > $EQTL/_order.bed.LIV
+zcat $BEDDIR/QC2CALLSET_nsv10.PM.reordered.bed.gz  | head -n1 | cut -f7- | tr '\t' '\n' > $EQTL/_order.bed.PM
+head -n1 $COV_LIV | tr '\t' '\n' | tail -n +2 > $EQTL/_order.cov.LIV
+head -n1 $COV_PM  | tr '\t' '\n' | tail -n +2 > $EQTL/_order.cov.PM
+
+# Quick equality checks (should all print 0 differing lines)
+diff $EQTL/_order.vcf.LIV $EQTL/_order.bed.LIV | wc -l #0
+diff $EQTL/_order.vcf.LIV $EQTL/_order.cov.LIV | wc -l #0 now, was 172 LIV_mds.txt
+diff $EQTL/_order.vcf.PM  $EQTL/_order.bed.PM  | wc -l #0
+diff $EQTL/_order.vcf.PM  $EQTL/_order.cov.PM  | wc -l #0 now, was 213 PM_mds.txt
+
+##########1000 lines of code later, qtltools time !!!
+#Test one QTLtools run (LIV, nsv = 10, chunk 1)
+EQTL=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+BEDDIR=$EQTL/MATURERNA_split
+
+VCF_LIV=$EQTL/LIV_only.vcf.gz
+COV_LIV=$EQTL/LIV_mds.qtltools.txt
+
+module load qtltools/1.1 tabix
+
+QTLtools cis \
+  --vcf   $VCF_LIV \
+  --bed   $BEDDIR/QC2CALLSET_nsv10.LIV.reordered.bed.gz \
+  --cov   $COV_LIV \
+  --permute 1000 \
+  --chunk 1 300 \
+  --out   $EQTL/test_LIV_nsv10_chunk1.txt
+
+head $EQTL/test_LIV_nsv10_chunk1.txt
+
+########################################### running everything !!!
+module load qtltools/1.1 tabix selfsched
+
+EQTL=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+BEDDIR=${EQTL}/MATURERNA_split                        # split + reordered BEDs
+SCR=${EQTL}/scratch                                   # scratch (optional)
+SDR=${EQTL}/scripts_qtltools_nominal                  # scripts + job files + logs
+RDR=${EQTL}/results_qtltools_nominal                  # results
+
+mkdir -p ${SCR} ${SDR}/{sch,run,log} ${RDR}/MATURERNA
+
+cd ${SDR}
+echo "" | tail -n+2 > ${SDR}/selfsched
+rm -f ${SDR}/sch/*
+
+# Loops: group (LIV/PM) × nsv (1–30) × chunks (1–300)
+for GROUP in LIV PM
+do
+  if [[ ${GROUP} == "LIV" ]]; then
+    VCF=${EQTL}/LIV_only.vcf.gz
+    COV=${EQTL}/LIV_mds.qtltools.txt
+  else
+    VCF=${EQTL}/PM_only.vcf.gz
+    COV=${EQTL}/PM_mds.qtltools.txt
+  fi
+
+  for NSV in {1..30}
+  do
+    BED=${BEDDIR}/QC2CALLSET_nsv${NSV}.${GROUP}.reordered.bed.gz
+
+    for CHUNK in {1..300}
+    do
+      OUT=${RDR}/MATURERNA/${GROUP}_nominal_nsv${NSV}_chunk${CHUNK}.txt
+
+      # *** KEY LINE: nominal instead of permute ***
+      #echo "QTLtools cis --vcf ${VCF} --bed ${BED} --permute 10000 --chunk ${CHUNK} 300 --out ${OUT} --cov ${COV}" \
+      echo "QTLtools cis --vcf ${VCF} --bed ${BED} --nominal 1 --chunk ${CHUNK} 300 --out ${OUT} --cov ${COV}" \
+        >> ${SDR}/selfsched
+    done
+  done
+done
+
+# Count & split master list
+wc -l ${SDR}/selfsched #18000
+split -a4 -d -l50 ${SDR}/selfsched ${SDR}/sch/selfsched_
+
+# submit many mini-schedulers
+cd ${SDR}
+for i in $(ls ${SDR}/sch/selfsched_???? | awk -F"_" '{print $NF}')
+do
+  cat > ${SDR}/run/selfsched_${i}.sh <<EOF
+#!/bin/bash
+#BSUB -q premium
+#BSUB -P acc_mscic1
+#BSUB -J selfsched_${i}
+#BSUB -n 30
+#BSUB -W 144:00
+#BSUB -R "rusage[mem=50000]"
+#BSUB -cwd ${SDR}/log
+#BSUB -oo selfsched_${i}.stdout
+#BSUB -eo selfsched_${i}.stderr
+#BSUB -L /bin/bash
+
+module load qtltools/1.1 tabix selfsched
+cd ${SDR}/log
+export fstatus=selfsched_${i}.fstatus
+mpirun -np 11 selfsched < ${SDR}/sch/selfsched_${i} > ${SDR}/run/selfsched_${i}.run
+EOF
+
+  bsub < ${SDR}/run/selfsched_${i}.sh
+done
+###################### SUMMARY: How many QTLtools are being submitted? 
+# loop structure: 
+GROUP: 2 levels         → LIV, PM
+NSV:   30 levels        → 1..30
+CHUNK: 300 chunks       → 1..300
+# So the total number of QTLtools cis commands is:
+#2 × 30 × 300 = 18,000 commands
+
+#This splits 18,000 commands into files of 50 each:
+split -a4 -d -l50 ${SDR}/selfsched ${SDR}/sch/selfsched_
+#18,000 / 50 = 360 split files
+### so 360 bsub jobs to the cluster!!!
+#Each bsub job uses 11 cores to run a mini-scheduler that executes 50 QTLtools commands internally
+
+/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA
+
+ls -lh $RDR/MATURERNA | head
+total 667G
+-rw-rw-r--+ 1 hoangd02 mscic1  42M Nov 14 15:43 LIV_nominal_nsv10_chunk100.txt
+-rw-rw-r--+ 1 hoangd02 mscic1  44M Nov 14 15:43 LIV_nominal_nsv10_chunk101.txt
+-rw-rw-r--+ 1 hoangd02 mscic1  41M Nov 14 15:43 LIV_nominal_nsv10_chunk102.txt
+-rw-rw-r--+ 1 hoangd02 mscic1  43M Nov 14 15:43 LIV_nominal_nsv10_chunk103.txt
+
+######Ummmm it's done???? that was so fast! like 10 mins? lol 
+
+ls -1 $EQTL/results_qtltools_nominal/MATURERNA | wc -l #16680 files
+
+## checking which chunks are empty: 
+#Those chunks simply never produced a file (likely no tests in those SNP–gene windows for that chunk).
+EQTL=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+
+count=$(
+for group in LIV PM; do
+  for nsv in {1..30}; do
+    for chunk in {1..300}; do
+      file="$EQTL/results_qtltools_nominal/MATURERNA/${group}_nominal_nsv${nsv}_chunk${chunk}.txt"
+      if [[ ! -s $file ]]; then
+        echo "MISSING_OR_EMPTY: ${group} nsv${nsv} chunk${chunk}"
+      fi
+    done
+  done
+done | wc -l
+)
+
+echo "Number of missing/empty chunks: $count" #1320
+
+############that's OK, combining all the chunks for each nsv now:
+EQTL=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+RDR=$EQTL/results_qtltools_nominal/MATURERNA
+
+shopt -s nullglob
+
+for GROUP in LIV PM; do
+  for NSV in {1..30}; do
+    files=(${RDR}/${GROUP}_nominal_nsv${NSV}_chunk*.txt)
+    if ((${#files[@]} == 0)); then
+      echo "No chunks for ${GROUP} nsv${NSV} (skipping)"
+      continue
+    fi
+    out=${RDR}/${GROUP}_nominal_nsv${NSV}.txt
+    echo "Combining ${#files[@]} chunks → ${out}"
+    cat "${files[@]}" > "${out}"
+  done
+done
+
+# Combining 278 chunks → /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/LIV_nominal_nsv1.txt
+# Combining 278 chunks → /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/LIV_nominal_nsv2.txt
+
+head $RDR/LIV_nominal_nsv10.txt
+wc -l $RDR/LIV_nominal_nsv10.txt #102960666 thats a lot of files !
+wc -l $RDR/LIV_nominal_nsv11.txt #102960666 
+
+################## ################## ################## ################## 
+################## ################## ################## ################## 
+
+################## YOU'VE REACHED THE END OF THE CODE THAT REALLY MATTERS. THE REST IS TRIALS AND ERRORS 
+## THAT ARE NOT USED IN SUBSEQUENT ANALYSES!
+
+
+
+
+
+################## Make a BESD file from QTLtools output ################## 
+https://yanglab.westlake.edu.cn/software/smr/#MakeaBESDfile
+
+##turns out you dont need to do this for rb!
+
+#########OKKI NEXT STEPS 
+#1. Load one nominal file: LIV_nominal_nsv10.txt.
+#2. Parse it into columns: gene ID, SNP ID, chromosome, position, effect allele, other allele, beta/slope, SE, p, N.
+#3. Construct a canonical SNP ID (chr:pos_A1_A2) that matches whatever you can derive from brainmeta.
+#4. Do an inner join between brainmeta and LIV_nominal_nsv10 on (SNP_canon, gene).
+#5. Inspect a small sample of rows to check:
+###Alleles line up (no systematic sign flips).
+###N’s look as expected (BrainMeta N vs 160 in LIV).
+#Once that merged BrainMeta–LIV table looks sane, you’ll do the same for PM, and then you’re ready to wrap them into OSCA/MeCS inputs and estimate rb.
+
+brainmeta <- readRDS("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eQTL_allchr_dump.rds")
+##this takes a while to load
+dim(brainmeta) #283,666,305        14
+
+################this code keeps running into errors
+# EQTL=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+# NOM_DIR=${EQTL}/results_qtltools_nominal/MATURERNA
+
+# LIV_NSV=10
+# PM_NSV=10
+
+# LIV_NOM=${NOM_DIR}/LIV_nominal_nsv${LIV_NSV}.txt
+# PM_NOM=${NOM_DIR}/PM_nominal_nsv${PM_NSV}.txt
+
+# $SMR \
+#   --eqtl-summary LIV_nominal_nsv10.txt \
+#   --qtltools-nominal-format \
+#   --make-besd \
+#   --out LIV_nsv10
+
+# osca \
+#   --befile LIV_nominal_nsv10.txt \
+#   --qtltools-nominal-format \
+#   --make-besd \
+#   --out LIV_nsv10
+
+# https://yanglab.westlake.edu.cn/smr-portal/doc/tutorial
+
+########### BEFORE RUNNING rb, create .esd files: 
+cd /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA
+
+########extracting only the relevant lines
+##.esd format is: 
+#Chr  SNP  Bp  A1  A2  Freq  Beta  se  p
+# Show first 5 lines with only the crucial columns:
+# $2 = phe_chr
+# $8 = var_id (chr3:26514067[b38]A,G)
+# $10 = var_start (Bp)
+# $12 = p-value
+# $13 = beta
+awk 'NR<=5 {print $2, $8, $10, $12, $13}' LIV_nominal_nsv10.txt
+
+# 3 chr3:26514067[b38]A,G 26514067 0.537862 -0.0177707
+# 3 chr3:26514103[b38]A,G 26514103 0.581458 -0.0160201
+# 3 chr3:26514366[b38]A,G 26514366 0.544236 -0.0174139
+# 3 chr3:26514376[b38]C,T 26514376 0.485739 -0.066556
+# 3 chr3:26514851[b38]C,G 26514851 0.533202 -0.0180632
+
+test<-fread("PM_nominal_nsv9.txt",data.table=FALSE)
+dim(test)
+head(test)
+  ENSG00000201033 3 27513872 27513872 + 3012 -999805 chr3:26514067[b38]A
+1 ENSG00000201033 3 27513872 27513872 + 3012 -999769 chr3:26514103[b38]A
+2 ENSG00000201033 3 27513872 27513872 + 3012 -999506 chr3:26514366[b38]A
+3 ENSG00000201033 3 27513872 27513872 + 3012 -999496 chr3:26514376[b38]C
+4 ENSG00000201033 3 27513872 27513872 + 3012 -999021 chr3:26514851[b38]C
+5 ENSG00000201033 3 27513872 27513872 + 3012 -999012 chr3:26514860[b38]C
+6 ENSG00000201033 3 27513872 27513872 + 3012 -998854 chr3:26515018[b38]G
+  G 3 26514067 26514067 0.503723 -0.0259601 0
+1 G 3 26514103 26514103 0.334068 -0.0373245 0
+2 G 3 26514366 26514366 0.503114 -0.0259923 0
+3 T 3 26514376 26514376 0.868314 -0.0204239 0
+4 G 3 26514851 26514851 0.516065 -0.0250012 0
+5 T 3 26514860 26514860 0.089726 -0.0645571 0
+6 T 3 26515018 26515018 0.740332 -0.0128185 0
+
+#gene ID/probe: ENSG00000201033
+#chr: 3 
+#gene start: 27513872 
+#gene end: 27513872  
+#strand orientation: +
+#number of SNPs tested for this gene: 3012
+#variant position relative to gene TSS (negative = upstream): -999805
+#SNP identifier: chr:posref_alt: chr3:26514067[b38]A
+#alternative/effect allele: G
+#variant chr: 3
+#Variant start (26514067) - SNP position
+#Variant end (26514067) - SNP position (same for SNVs)
+#Alt allele freq (0.503723) - frequency of effect allele
+#Beta (-0.0259601) - regression slope (effect size)
+#P-value (0) - nominal association p-value
+
+cd /sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary
+#for each chromosome, there are 4 files:
+BrainMeta_cis_eQTL_chr10.besd #Binary eQTL summary data showing the compact binary matrix of SNP–gene association statistics (e.g., beta, SE, p-value, sample size).
+BrainMeta_cis_eQTL_chr10.epi #Expression Probe Information, Content: metadata describing each gene or transcript tested in the eQTL analysis 
+BrainMeta_cis_eQTL_chr10.esi #SNP Information, Content: list of all SNPs (variants) tested in the eQTL analysis.     
+BrainMeta_cis_eQTL_chr10.summary #? Text summary statistics, a summary table of eQTL analysis results in plain text format
+
+#if desire, can turn besd files into .txt file
+module load smr/1.4.0
+# Dump ALL stored entries (set a lenient p-thresh) ~~ only 22 chromosomes, no sex chromosome
+smr --beqtl-summary BrainMeta_cis_eQTL_chr22 \
+    --query 1 \
+    --out BrainMeta_cis_eQTL_chr22_dump
+
+sum <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_cis_eQTL_chr10_dump.txt", data.table = FALSE)
+head(sum)
+          SNP Chr    BP A1 A2      Freq             Probe Probe_Chr Probe_bp
+1 rs781902650  10 60403  A  G 0.0136612 ENSG00000261456.6        10   106466
+2 rs782439347  10 60637  G  A 0.0628415 ENSG00000261456.6        10   106466
+3 rs569167217  10 60684  C  A 0.0628415 ENSG00000261456.6        10   106466
+4 rs532801013  10 61283  A  G 0.0114183 ENSG00000261456.6        10   106466
+5 rs548639866  10 61331  G  A 0.0628415 ENSG00000261456.6        10   106466
+6 rs782036520  10 61372  C CA 0.7065970 ENSG00000261456.6        10   106466
+   Gene Orientation         b       SE         p
+1 TUBB8           - -0.144296 0.112159 0.1982580
+2 TUBB8           - -0.118026 0.127103 0.3531020
+3 TUBB8           - -0.118026 0.127103 0.3531020
+4 TUBB8           - -0.138086 0.234169 0.5554030
+5 TUBB8           - -0.140844 0.124429 0.2576640
+6 TUBB8           - -0.178767 0.102514 0.0811885
+
+########testing to make a BESD file 
+#https://yanglab.westlake.edu.cn/software/smr/#MakeaBESDfile
+/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/PM_nominal_nsv9.txt
+module load smr/1.4.0
+
+smr --eqtl-summary PM_nominal_nsv9.txt --qtltools-nominal-format --make-besd --out PM_nominal_nsv9besd 
+
+head PM_nominal_nsv9.txt
+# ENSG00000201033 3 27513872 27513872 + 3012 -999805 chr3:26514067[b38]A,G 3 26514067 26514067 0.503723 -0.0259601 0
+# ENSG00000201033 3 27513872 27513872 + 3012 -999769 chr3:26514103[b38]A,G 3 26514103 26514103 0.334068 -0.0373245 0
+# ENSG00000201033 3 27513872 27513872 + 3012 -999506 chr3:26514366[b38]A,G 3 26514366 26514366 0.503114 -0.0259923 0
+
+head -1 PM_nominal_nsv9.txt | wc -w
+#14
+
+smr \
+  --eqtl-summary PM_nominal_nsv9.txt \
+  --qtltools-nominal-format \
+  --make-besd \
+  --out PM_nominal_nsv9besd
+
+###expected format 
+# ENSG00000237438.2 chr22 17517460 17517460 + 5803 -165953 rs5748687 chr22 17351507 17351507 0.00227542 -0.225077 0
+# ENSG00000237438.2 chr22 17517460 17517460 + 5803 -165363 rs4006343 chr22 17352097 17352097 0.0022876 -0.226253 0
+# ENSG00000237438.2 chr22 17517460 17517460 + 5803 -164231 rs3875996 chr22 17353229 17353229 0.00181073 -0.233649 0
+
+##what needs to be changed: add 'chr' in 2 places in front of 3 and maybe chr3:26514067[b38]A,G
+#just adding chr for now 
+awk 'BEGIN{OFS="\t"} {
+    print $1, "chr"$2, $3, $4, $5, $6, $7, $8, "chr"$9, $10, $11, $12, $13, $14
+}' PM_nominal_nsv9.txt > PM_nominal_nsv9_formatted.txt
+
+head PM_nominal_nsv9_formatted.txt
+# ENSG00000201033	chr3	27513872	27513872	+	3012	-999805	chr3:26514067[b38]A,G	chr3	265140626514067	0.503723	-0.0259601	0
+# ENSG00000201033	chr3	27513872	27513872	+	3012	-999769	chr3:26514103[b38]A,G	chr3	265141026514103	0.334068	-0.0373245	0
+# ENSG00000201033	chr3	27513872	27513872	+	3012	-999506	chr3:26514366[b38]A,G	chr3	265143626514366	0.503114	-0.0259923	0
+
+smr --eqtl-summary PM_nominal_nsv9_formatted.txt --qtltools-nominal-format --make-besd --out PM_nominal_nsv9besd 
+#ERROR: the number of columns is incorrect in row 1.
+
+##change chr3:26514067[b38]A,G --> rs26514067
+awk 'BEGIN{OFS="\t"} {
+    # Create simple SNP ID from chr:position
+    snp_id = "rs" $10
+    print $1, $2, $3, $4, $5, $6, $7, snp_id, $9, $10, $11, $12, $13, $14
+}' PM_nominal_nsv9_formatted.txt > PM_nominal_nsv9_simple.txt
+
+head PM_nominal_nsv9_simple.txt
+ENSG00000201033	chr3	27513872	27513872	+	3012	-999805	rs26514067	chr3	26514067	26514067	0.503723	-0.0259601	0
+ENSG00000201033	chr3	27513872	27513872	+	3012	-999769	rs26514103	chr3	26514103	26514103	0.334068	-0.0373245	0
+ENSG00000201033	chr3	27513872	27513872	+	3012	-999506	rs26514366	chr3	26514366	26514366	0.503114	-0.0259923	0
+
+##first line has 14 fields
+awk 'NR==1{print "NF=" NF; for (i=1;i<=NF;i++) print i, "["$i"]"}' PM_nominal_nsv9_simple.txt
+
+smr --eqtl-summary PM_nominal_nsv9_simple.txt --qtltools-nominal-format --make-besd --out PM_nominal_nsv9besd 
+##New error:
+#Segmentation fault (core dumped)
+
+#according to Claude, this crashed because memory issue, unexpected data format or bug in SMR with certain edge cases  
+wc -l PM_nominal_nsv9_simple.txt #102,960,666
+
+#try a small subset to see if it works
+head -1000 PM_nominal_nsv9_simple.txt > PM_nominal_nsv9_test.txt
+smr --eqtl-summary PM_nominal_nsv9_test.txt --qtltools-nominal-format --make-besd --out PM_nominal_nsv9besd_test
+
+# Check for missing values or weird characters
+awk -F'\t' '{
+    for(i=1;i<=NF;i++) {
+        if($i == "" || $i == "NA" || $i == "nan") {
+            print "Row", NR, "Column", i, "has missing/invalid value"
+        }
+    }
+}' PM_nominal_nsv9_simple.txt | head -20
+
+head -3 PM_nominal_nsv9_simple.txt | cat -A
+
+# ##Converting it to tab-delimited format: DID NOT WORK
+# awk '{$1=$1}1' OFS='\t' PM_nominal_nsv9.txt > PM_nominal_nsv9_tab.txt
+# #Then verify it's tab-delimited:
+# head -1 PM_nominal_nsv9_tab.txt | awk -F'\t' '{print NF}'
+
+# smr --eqtl-summary PM_nominal_nsv9_tab.txt --qtltools-nominal-format --make-besd --out PM_nominal_nsv9besd
+
+###########testing rb on one snp-gene, 
+#For each SNP–gene pair, you need matching IDs and the effect size + uncertainty from both datasets.
+library(data.table)
+
+# Load data
+brainmeta <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_cis_eQTL_chr3_dump.txt")
+
+pm <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/PM_nominal_nsv9.txt", header = FALSE, sep = " ")
+# liv <- fread("LIV_nominal_nsv9.txt")  # assuming similar format
+dim(pm) #102960665         2
+
+# qtltoolsnomi.txt
+# This file has no header. the 14 columns are The columns are: 
+# 1. The phenotype ID 
+# 2. The chromosome ID of the phenotype 
+# 3. The start position of the phenotype 
+# 4. The end position of the phenotype 
+# 5. The strand orientation of the phenotype 
+# 6. The total number of variants tested in cis 
+# 7. The distance between the phenotype and the tested variant (accounting for strand orientation) 
+# 8. The ID of the tested variant 
+# 9. The chromosome ID of the variant 
+# 10. The start position of the variant 
+# 11. The end position of the variant 
+# 12. The nominal P-value of association between the variant and the phenotype 
+# 13. The corresponding regression slope 1
+# 4. A binary flag equal to 1 is the variant is the top variant in cis. 
+# ([https://qtltools.github.io/qtltools/pages/modecisnominal.html]).
+
+# ---- Assign column names to PM ----
+colnames(pm) <- c("gene_id", "gene_chr", "gene_start", "gene_end", 
+                  "strand", "n_variants", "distance", "variant_id",
+                  "var_chr", "var_start", "var_end",
+                  "pval", "beta", "top_flag")
+
+head(pm)
+# ---- Parse PM data ----
+pm[, variant_pos := as.integer(sub(".*:(\\d+)\\[.*", "\\1", variant_id))]
+pm[, variant_chr := as.integer(sub("chr(\\d+):.*", "\\1", variant_id))]
+pm[, snp_key := paste0("chr", variant_chr, ":", variant_pos)]
+
+#########calculating SE
+pm[, z := ifelse(pval > 0 & pval < 1, qnorm(1 - pval/2),
+                 ifelse(pval == 0, 38, 1e-6))]
+pm[, se := abs(beta) / abs(z)]
+
+head(pm)
+           gene_id gene_chr gene_start gene_end strand n_variants distance
+            <char>    <int>      <int>    <int> <char>      <int>    <int>
+1: ENSG00000201033        3   27513872 27513872      +       3012  -999805
+2: ENSG00000201033        3   27513872 27513872      +       3012  -999769
+3: ENSG00000201033        3   27513872 27513872      +       3012  -999506
+4: ENSG00000201033        3   27513872 27513872      +       3012  -999496
+5: ENSG00000201033        3   27513872 27513872      +       3012  -999021
+6: ENSG00000201033        3   27513872 27513872      +       3012  -999012
+              variant_id var_chr var_start  var_end     pval       beta
+                  <char>   <int>     <int>    <int>    <num>      <num>
+1: chr3:26514067[b38]A,G       3  26514067 26514067 0.503723 -0.0259601
+2: chr3:26514103[b38]A,G       3  26514103 26514103 0.334068 -0.0373245
+3: chr3:26514366[b38]A,G       3  26514366 26514366 0.503114 -0.0259923
+4: chr3:26514376[b38]C,T       3  26514376 26514376 0.868314 -0.0204239
+5: chr3:26514851[b38]C,G       3  26514851 26514851 0.516065 -0.0250012
+6: chr3:26514860[b38]C,T       3  26514860 26514860 0.089726 -0.0645571
+   top_flag variant_pos variant_chr       snp_key         z         se
+      <int>       <int>       <int>        <char>     <num>      <num>
+1:        0    26514067           3 chr3:26514067 0.6686434 0.03882503
+2:        0    26514103           3 chr3:26514103 0.9659524 0.03864010
+3:        0    26514366           3 chr3:26514366 0.6695981 0.03881776
+4:        0    26514376           3 chr3:26514376 0.1658004 0.12318363
+5:        0    26514851           3 chr3:26514851 0.6494230 0.03849756
+6:        0    26514860           3 chr3:26514860 1.6968448 0.03804538
+
+#### rb calculations 
+#' Calculate rb correlation between tissue eQTL effects:
+#' @param dat_top Data frame with one row per gene (top eQTL only)
+#'   Required columns: gene, beta_ref, se_ref, beta_test, se_test
+#' @param dat_cis Optional: All cis-SNPs per gene for r_e estimation
+#'   Required if assume_overlap=TRUE: gene, beta_ref, beta_test, p_ref, p_test
+#' @param assume_overlap Logical: assume potential sample overlap?
+#' 
+#' @return List with r_b estimate and jackknife SE
+compute_rb <- function(dat_top, 
+                       dat_cis = NULL, 
+                       assume_overlap = FALSE,
+                       p_null_threshold = 0.01) {
+  
+  # Step 1: Estimate variance of errors (average SE^2)
+  var_e_ref  <- mean(dat_top$se_ref^2, na.rm = TRUE)
+  var_e_test <- mean(dat_top$se_test^2, na.rm = TRUE)
+  
+  cat(sprintf("var(e_ref) = %.6f\n", var_e_ref))
+  cat(sprintf("var(e_test) = %.6f\n", var_e_test))
+  
+  # Step 2: Estimate r_e (correlation of errors)
+  if (assume_overlap && !is.null(dat_cis)) {
+    cat("Estimating r_e from null SNPs (P > ", p_null_threshold, ") per gene...\n")
+    
+    # Compute r_e for each gene using null SNPs in cis-region
+    r_e_per_gene <- sapply(unique(dat_top$gene), function(g) {
+      null_snps <- dat_cis %>%
+        filter(gene == g, 
+               p_ref > p_null_threshold, 
+               p_test > p_null_threshold)
+      
+      if (nrow(null_snps) < 10) return(NA)  # Need sufficient null SNPs
+      
+      cor(null_snps$beta_ref, null_snps$beta_test, use = "complete.obs")
+    })
+    
+    r_e_hat <- mean(r_e_per_gene, na.rm = TRUE)
+    cat(sprintf("Mean r_e across genes = %.6f (estimated from %d genes)\n", 
+                r_e_hat, sum(!is.na(r_e_per_gene))))
+    
+  } else {
+    r_e_hat <- 0  # No overlap or no cis data provided
+    cat("Assuming r_e = 0 (no sample overlap)\n")
+  }
+  
+  # Step 3: Compute observed statistics across genes
+  var_bhat_ref  <- var(dat_top$beta_ref, na.rm = TRUE)
+  var_bhat_test <- var(dat_top$beta_test, na.rm = TRUE)
+  cov_bhat      <- cov(dat_top$beta_ref, dat_top$beta_test, use = "complete.obs")
+  
+  cat(sprintf("var(beta_ref) = %.6f\n", var_bhat_ref))
+  cat(sprintf("var(beta_test) = %.6f\n", var_bhat_test))
+  cat(sprintf("cov(beta_ref, beta_test) = %.6f\n", cov_bhat))
+  
+  # Step 4: Calculate r_b (Equation 3 from paper)
+  numerator <- cov_bhat - r_e_hat * sqrt(var_e_ref * var_e_test)
+  denominator <- sqrt((var_bhat_ref - var_e_ref) * (var_bhat_test - var_e_test))
+  
+  r_b_hat <- numerator / denominator
+  
+  cat(sprintf("\nPoint estimate: r_b = %.4f\n", r_b_hat))
+  
+  # Step 5: Jackknife standard error (leave-one-gene-out)
+  n_genes <- nrow(dat_top)
+  cat(sprintf("Computing jackknife SE (n = %d genes)...\n", n_genes))
+  
+  r_b_jackknife <- numeric(n_genes)
+  
+  for (i in 1:n_genes) {
+    dat_i <- dat_top[-i, ]
+    
+    # Recalculate for jackknife sample
+    var_bhat_ref_i  <- var(dat_i$beta_ref, na.rm = TRUE)
+    var_bhat_test_i <- var(dat_i$beta_test, na.rm = TRUE)
+    cov_bhat_i      <- cov(dat_i$beta_ref, dat_i$beta_test, use = "complete.obs")
+    
+    # Note: var_e and r_e stay constant (estimated from full sample)
+    num_i <- cov_bhat_i - r_e_hat * sqrt(var_e_ref * var_e_test)
+    den_i <- sqrt((var_bhat_ref_i - var_e_ref) * (var_bhat_test_i - var_e_test))
+    
+    r_b_jackknife[i] <- num_i / den_i
+  }
+  
+  # Jackknife variance (Equation 4 from paper)
+  r_b_mean_jack <- mean(r_b_jackknife)
+  se_jackknife <- sqrt(((n_genes - 1) / n_genes) * sum((r_b_jackknife - r_b_mean_jack)^2))
+  
+  cat(sprintf("Jackknife SE = %.4f\n", se_jackknife))
+  cat(sprintf("95%% CI: [%.4f, %.4f]\n", 
+              r_b_hat - 1.96*se_jackknife, 
+              r_b_hat + 1.96*se_jackknife))
+  
+  # Return results
+  list(
+    r_b = r_b_hat,
+    se = se_jackknife,
+    ci_lower = r_b_hat - 1.96*se_jackknife,
+    ci_upper = r_b_hat + 1.96*se_jackknife,
+    n_genes = n_genes,
+    r_e = r_e_hat,
+    var_e_ref = var_e_ref,
+    var_e_test = var_e_test,
+    jackknife_estimates = r_b_jackknife
+  )
+}
+
+#' Test if two r_b estimates are significantly different
+#' 
+test_rb_difference <- function(rb1, rb2) {
+  # Z-test for difference
+  diff <- rb1$r_b - rb2$r_b
+  se_diff <- sqrt(rb1$se^2 + rb2$se^2)  # Assuming independence
+  z <- diff / se_diff
+  p <- 2 * pnorm(-abs(z))
+  
+  cat(sprintf("\nTest of difference:\n"))
+  cat(sprintf("r_b1 = %.4f (SE = %.4f)\n", rb1$r_b, rb1$se))
+  cat(sprintf("r_b2 = %.4f (SE = %.4f)\n", rb2$r_b, rb2$se))
+  cat(sprintf("Difference = %.4f (SE = %.4f)\n", diff, se_diff))
+  cat(sprintf("Z = %.4f, P = %.4e\n", z, p))
+  
+  list(
+    difference = diff,
+    se = se_diff,
+    z = z,
+    p_value = p
+  )
+}
+
+
+library(dplyr)
+
+# Load your data
+# dat_brainmeta: BrainMeta top eQTLs (discovery set)
+# dat_liv: Living brain top eQTLs
+# dat_pm: Postmortem brain top eQTLs
+
+# ============================================
+# Analysis 1: BrainMeta vs Living (LIV)
+# ============================================
+library(data.table)
+
+# Load data
+#one chr: dat_brainmeta <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_cis_eQTL_chr3_dump.txt")
+
+# Read all chromosomes
+# dat_brainmeta <- rbindlist(lapply(1:22, function(chr) {
+#   fread(sprintf("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_cis_eQTL_chr%d_dump.txt", chr))
+# }))
+
+# # After combining all chromosomes
+# fwrite(dat_brainmeta, 
+#        "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_all_chr.txt",
+#        sep = "\t")
+
+##next time, just load: 
+dat_brainmeta <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/BrainMeta_cis_eqtl_summary/BrainMeta_all_chr.txt")
+dim(dat_brainmeta)
+#283666305        14
+
+# Select top eQTL per gene (smallest p-value)
+dat_brainmeta_top <- dat_brainmeta[, .SD[which.min(p)], by = Probe]
+
+dim(dat_brainmeta_top)
+#16743    14
+
+# Rename for clarity
+setnames(dat_brainmeta_top, 
+         old = c("Probe", "b", "SE", "SNP"),
+         new = c("gene", "beta_ref", "se_ref", "snp"))
+
+#pm <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/PM_nominal_nsv9.txt", header = FALSE, sep = " ")
+liv <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/LIV_nominal_nsv9.txt", header = FALSE, sep = " ")
+dim(liv) #102960666        14
+
+# ---- Assign column names to LIV ----
+colnames(liv) <- c("gene_id", "gene_chr", "gene_start", "gene_end", 
+                  "strand", "n_variants", "distance", "variant_id",
+                  "var_chr", "var_start", "var_end",
+                  "pval", "beta", "top_flag")
+
+# ---- Parse LIV data ----
+liv[, variant_pos := as.integer(sub(".*:(\\d+)\\[.*", "\\1", variant_id))]
+liv[, variant_chr := as.integer(sub("chr(\\d+):.*", "\\1", variant_id))]
+liv[, snp_key := paste0("chr", variant_chr, ":", variant_pos)]
+
+#########calculating SE
+liv[, z := ifelse(pval > 0 & pval < 1, qnorm(1 - pval/2),
+                 ifelse(pval == 0, 38, 1e-6))]
+liv[, se := abs(beta) / abs(z)]
+
+# # Select top eQTL per gene (smallest p-value) DONT DO THIS!
+# dat_liv_top <- liv[, .SD[which.min(pval)], by = gene_id]
+# dim(dat_liv_top)
+# #27569    19
+
+# Keep BrainMeta top eQTLs as before
+dat_brainmeta_top[, gene_clean := sub("\\..*", "", gene)]
+dat_brainmeta_top[, snp_key := paste0("chr", Chr, ":", BP)]
+
+# For LIV: keep ALL cis-SNPs (not just top)
+# First create matching keys in the full LIV data
+liv[, snp_key := paste0("chr", var_chr, ":", var_start)]
+
+# Now match BrainMeta's top eQTLs to LIV
+dat_brainmeta_liv <- merge(
+  dat_brainmeta_top[, .(gene_clean, snp_key, beta_ref, se_ref)],
+  liv[, .(gene_id, snp_key, beta_test = beta, se_test = se)],
+  by.x = c("gene_clean", "snp_key"),
+  by.y = c("gene_id", "snp_key")
+)
+
+dim(dat_brainmeta_liv) #89  6
+
+rb_liv <- compute_rb(
+  dat_top = dat_brainmeta_liv,
+  assume_overlap = FALSE  # LIV is unique
+)
+
+# var(e_ref) = 0.002853
+# var(e_test) = 0.045119
+# Assuming r_e = 0 (no sample overlap)
+# var(beta_ref) = 0.567767
+# var(beta_test) = 0.104096
+# cov(beta_ref, beta_test) = 0.096407
+
+# Point estimate: r_b = 0.5282
+# Computing jackknife SE (n = 89 genes)...
+# Jackknife SE = 0.1827
+# 95% CI: [0.1700, 0.8864]
+
+# Your r_b = 0.53 (SE = 0.18) means:
+# The correlation of true cis-eQTL effects between BrainMeta and Living brain is ~0.53
+# This is lower than expected - the paper found r_b ~ 0.70-0.77 for brain-blood
+# Living vs postmortem brain should be higher than brain-blood
+
+# Why it's low:
+# Very small N (89 genes) - huge uncertainty (CI: 0.17 to 0.89!)
+# SNP panel mismatch - you're only capturing genes where the exact same SNP happened to be tested in both datasets
+# Selection bias - these 89 genes may not represent typical genes
+
+# What to do:
+# You need more matched genes. The paper used ~4,000 genes for brain-blood comparisons.
+
+save.image("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/rb_analysis.RData")
+
+load("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/rb_analysis.RData")
+
+# ============================================
+# Analysis 2: BrainMeta vs Postmortem (PM)
+# ============================================
+
+dat_brainmeta_pm <- dat_brainmeta %>%
+  inner_join(dat_pm, by = c("gene", "snp"), suffix = c("_ref", "_test")) %>%
+  select(gene, snp, 
+         beta_ref, se_ref,    # BrainMeta
+         beta_test, se_test)  # PM
+
+cat("\n=== r_b(BrainMeta, Postmortem) ===\n")
+
+# Option A: If you're confident no overlap with BrainMeta v2
+rb_pm <- compute_rb(
+  dat_top = dat_brainmeta_pm,
+  assume_overlap = FALSE
+)
+
+# Option B: If uncertain about overlap (CONSERVATIVE)
+# You'd need all cis-SNPs for each gene to estimate r_e
+rb_pm <- compute_rb(
+  dat_top = dat_brainmeta_pm,
+  dat_cis = dat_pm_all_cis,  # All cis-SNPs, not just top
+  assume_overlap = TRUE
+)
+
+# ============================================
+# Analysis 3: Test difference
+# ============================================
+
+test_rb_difference(rb_liv, rb_pm)
+
+#### test for fun, manually calculating rb for one nsv:
+# brainmeta[, snp_key := paste0("chr", Chr, ":", BP)]
+# brainmeta[, Probe := sub("\\..*", "", Probe)] #getting rid of decimal and number after
+
+# pm[, snp_key := paste0("chr", var_chr, ":", var_start)]
+
+# merged <- merge(
+#   brainmeta,
+#   pm,
+#   by.x = c("Probe", "snp_key"),
+#   by.y = c("gene_id", "snp_key")
+# )
+# dim(merged) #12181     8
+
+# merged<-merged[,c("Probe","snp_key","b","SE", "p","beta","pval","se")]
+# setnames(merged,
+#          old = c("b", "SE", "p", "beta","se","pval"),
+#          new = c("bm_beta", "bm_se", "bm_p","pm_beta","pm_se","pm_pval"))
+
+# # Now for a given gene, you have b_brainmeta, SE_brainmeta, beta_pm, se_pm
+# # which is exactly what you need to estimate rb or feed into MeCS/BESD construction.
+
+# brainmeta[, snp_key := paste0("chr", Chr, ":", BP)]
+# brainmeta[, gene_id := Probe]
+
+# # ---- Match SNP-gene pairs ----
+# pm[, pair := paste(gene_id, snp_key, sep = "|")]
+# brainmeta[, pair := paste(gene_id, snp_key, sep = "|")]
+
+# # Keep only overlapping pairs
+# overlap <- intersect(pm$pair, brainmeta$pair)
+# cat("Overlapping SNP-gene pairs:", length(overlap), "\n")
+
+# pm_matched <- pm[pair %in% overlap, 
+#                   .(pair, gene = gene_id, snp_key, beta_pm = beta, se_pm = se)]
+# bm_matched <- brainmeta[pair %in% overlap,
+#                          .(pair, gene = gene_id, snp_key, beta_bm = b, se_bm = SE)]
+
+# # Merge
+# merged <- merge(bm_matched, pm_matched, by = "pair")
+
+# # Remove NAs
+# merged <- merged[complete.cases(merged[, .(beta_bm, se_bm, beta_pm, se_pm)])]
+# cat("Complete cases:", nrow(merged), "\n")
+
+# # ---- Calculate rb statistic ----
+# calc_rb <- function(beta1, se1, beta2, se2) {
+#   r_obs <- cor(beta1, beta2, method = "pearson")
+#   r_e1 <- cor(beta1, se1)^2
+#   r_e2 <- cor(beta2, se2)^2
+#   r_e <- cor(se1, se2)
+#   rb <- (r_obs - r_e) / sqrt((1 - r_e1) * (1 - r_e2))
+  
+#   return(list(rb = rb, r_obs = r_obs, n = length(beta1)))
+# }
+
+# rb_pm <- calc_rb(merged$beta_bm, merged$se_bm, 
+#                  merged$beta_pm, merged$se_pm)
+
+# print(paste0("rb(BrainMeta, PM) = ", round(rb_pm$rb, 3), 
+#              " (n=", rb_pm$n, " SNP-gene pairs)"))
+
+####################
+#################### STREAMLINING, CALCULATING ALL THE SE AT ONCE!
+####################
+library(parallel)
+library(data.table)
+
+# Define function to process each file
+process_file <- function(nsv, input_dir, output_dir, dataset) {
+  file_path <- paste0(input_dir, dataset, "_nominal_nsv", nsv, ".txt")
+  
+  dt <- fread(file_path, header = FALSE, sep = " ",
+              select = c(1, 8, 12, 13),
+              col.names = c("Gene", "variant_id", "p", "b"))
+  
+  dt[, se := abs(b) / qnorm(p/2, lower.tail = FALSE)]
+  dt[p == 0, se := abs(b) / 38]
+  
+  dt[, c("chr_temp", "bp_temp") := tstrsplit(variant_id, ":", fixed = TRUE)[1:2]]
+  dt[, Chr := as.integer(sub("chr", "", chr_temp))]
+  dt[, BP := as.integer(sub("\\[.*", "", bp_temp))]
+  dt[, SNP := variant_id]
+  
+  out <- dt[, .(SNP, Chr, BP, Gene, b, se, p)]
+  fwrite(out, paste0(output_dir, dataset, "_nsv", nsv, "_osca.txt"), 
+         sep = "\t", quote = FALSE)
+  
+  return(nsv)
+}
+
+# Set directories
+input_dir <- "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/"
+output_dir <- paste0(input_dir, "osca_format/")
+
+# Create output directory if it doesn't exist
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Run in parallel
+results <- mclapply(1:30, function(nsv) {
+  liv_result <- process_file(nsv, input_dir, output_dir, "LIV")
+  pm_result <- process_file(nsv, input_dir, output_dir, "PM")
+  cat("Processed nsv", nsv, "\n")
+  return(list(liv = liv_result, pm = pm_result))
+}, mc.cores = 8)  # Adjust mc.cores based on available CPUs
+
+cat("All files processed successfully!\n")
+cat("Output files saved to:", output_dir, "\n")
+
+###checking the output:
+library(data.table)
+
+# Read one of the output files
+test_out <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/osca_format/PM_nsv9_osca.txt")
+
+# Look at the structure
+head(test_out)
+                     SNP   Chr       BP            Gene          b         se
+                  <char> <int>    <int>          <char>      <num>      <num>
+1: chr3:26514067[b38]A,G     3 26514067 ENSG00000201033 -0.0259601 0.03882503
+2: chr3:26514103[b38]A,G     3 26514103 ENSG00000201033 -0.0373245 0.03864010
+3: chr3:26514366[b38]A,G     3 26514366 ENSG00000201033 -0.0259923 0.03881776
+4: chr3:26514376[b38]C,T     3 26514376 ENSG00000201033 -0.0204239 0.12318363
+5: chr3:26514851[b38]C,G     3 26514851 ENSG00000201033 -0.0250012 0.03849756
+6: chr3:26514860[b38]C,T     3 26514860 ENSG00000201033 -0.0645571 0.03804538
+          p
+      <num>
+1: 0.503723
+2: 0.334068
+3: 0.503114
+4: 0.868314
+5: 0.516065
+6: 0.089726
+
+# Check for missing values
+colSums(is.na(test_out))
+#  SNP  Chr   BP Gene    b   se    p 
+#    0    0    0    0    0 1180    0
+
+# Check for infinite values
+colSums(is.infinite(as.matrix(test_out[, .(b, se, p)])))
+#  b se  p 
+#  0 40  0
+
+test_liv <- fread("/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/osca_format/LIV_nsv9_osca.txt")
+head(test_liv)
+#                      SNP   Chr       BP            Gene          b         se
+#                   <char> <int>    <int>          <char>      <num>      <num>
+# 1: chr3:26514067[b38]A,G     3 26514067 ENSG00000201033 -0.0189967 0.02888292
+# 2: chr3:26514103[b38]A,G     3 26514103 ENSG00000201033 -0.0171315 0.02909846
+# 3: chr3:26514366[b38]A,G     3 26514366 ENSG00000201033 -0.0186154 0.02875251
+# 4: chr3:26514376[b38]C,T     3 26514376 ENSG00000201033 -0.0689165 0.09559936
+# 5: chr3:26514851[b38]C,G     3 26514851 ENSG00000201033 -0.0191589 0.02902508
+# 6: chr3:26514860[b38]C,T     3 26514860 ENSG00000201033 -0.0112696 0.02976578
+#           p
+#       <num>
+# 1: 0.510722
+# 2: 0.556034
+# 3: 0.517350
+# 4: 0.470978
+# 5: 0.509202
+# 6: 0.704978
+colSums(is.na(test_liv))
+  # SNP   Chr    BP  Gene     b    se     p 
+  #   0     0     0     0     0 14519     0 
+
+colSums(is.infinite(as.matrix(test_liv[, .(b, se, p)])))
+#  b se  p 
+#  0 47  0
+
+##check all files at once:
+check_all_files <- function(output_dir) {
+  results <- list()
+  
+  for(nsv in 1:30) {
+    for(dataset in c("LIV", "PM")) {
+      file_path <- paste0(output_dir, dataset, "_nsv", nsv, "_osca.txt")
+      
+      if(file.exists(file_path)) {
+        dt <- fread(file_path)
+        
+        results[[paste0(dataset, "_nsv", nsv)]] <- list(
+          n_rows = nrow(dt),
+          n_genes = uniqueN(dt$Gene),
+          n_snps = uniqueN(dt$SNP),
+          has_na = any(is.na(dt)),
+          has_inf = any(is.infinite(as.matrix(dt[, .(b, se, p)]))),
+          mean_se = mean(dt$se),
+          median_p = median(dt$p),
+          n_extreme_p = sum(dt$p == 0)
+        )
+      } else {
+        results[[paste0(dataset, "_nsv", nsv)]] <- "File not found"
+      }
+    }
+  }
+  
+  return(results)
+}
+
+output_dir <- "/sc/arion/projects/mscic1/results/jolie/LBP/eqtl/results_qtltools_nominal/MATURERNA/osca_format/"
+checks <- check_all_files(output_dir)
+
+# View summary
+#str(checks)
+
+# Convert to data.frame for easier viewing
+summary_df <- do.call(rbind, lapply(names(checks), function(name) {
+  if(is.list(checks[[name]])) {
+    data.frame(file = name, checks[[name]])
+  }
+}))
+
+head(summary_df)
+      file    n_rows n_genes  n_snps has_na has_inf mean_se  median_p
+1 LIV_nsv1 102960666   27569 4842829   TRUE    TRUE      NA 0.5005190
+2  PM_nsv1 102960666   27569 4842829   TRUE    TRUE      NA 0.4964415
+3 LIV_nsv2 102960666   27569 4842829   TRUE    TRUE      NA 0.5000360
+4  PM_nsv2 102960666   27569 4842829   TRUE    TRUE      NA 0.4961970
+5 LIV_nsv3 102960666   27569 4842829   TRUE    TRUE      NA 0.5000090
+6  PM_nsv3 102960666   27569 4842829   TRUE    TRUE      NA 0.4963790
+  n_extreme_p
+1           0
+2           0
+3           0
+4           0
+5           0
+6           0
+
+tail(summary_df)
+        file    n_rows n_genes  n_snps has_na has_inf mean_se median_p
+55 LIV_nsv28 102960666   27569 4842829   TRUE    TRUE      NA 0.499561
+56  PM_nsv28 102960666   27569 4842829   TRUE    TRUE      NA 0.494513
+57 LIV_nsv29 102960666   27569 4842829   TRUE    TRUE      NA 0.499564
+58  PM_nsv29 102960666   27569 4842829   TRUE    TRUE      NA 0.494545
+59 LIV_nsv30 102960666   27569 4842829   TRUE    TRUE      NA 0.499449
+60  PM_nsv30 102960666   27569 4842829   TRUE    TRUE      NA 0.494575
+   n_extreme_p
+55           0
+56           0
+57           0
+58           0
+59           0
+60           0
+
+table(summary_df$n_rows)
+102960666 
+       60 
+
+################################this is for permuted
+# #+BEGIN_SRC shell
+# # setup
+# module load qtltools/1.1 tabix selfsched
+
+# EQTL=/sc/arion/projects/mscic1/results/jolie/LBP/eqtl
+# BEDDIR=${EQTL}/MATURERNA_split                        # split + reordered BEDs
+# SCR=${EQTL}/scratch                                   # scratch (optional)
+# SDR=${EQTL}/scripts_qtltools                          # scripts + job files + logs
+# RDR=${EQTL}/results_qtltools                          # results
+
+# mkdir -p ${SCR} ${SDR}/{sch,run,log} ${RDR}/MATURERNA
+
+# cd ${SDR}
+# echo "" | tail -n+2 > ${SDR}/selfsched
+# rm -f ${SDR}/sch/*
+
+# # Loops: group (LIV/PM) × nsv (1–30) × chunks (1–300)
+# for GROUP in LIV PM
+# do
+#   if [[ ${GROUP} == "LIV" ]]; then
+#     VCF=${EQTL}/LIV_only.vcf.gz
+#     COV=${EQTL}/LIV_mds.qtltools.txt
+#   else
+#     VCF=${EQTL}/PM_only.vcf.gz
+#     COV=${EQTL}/PM_mds.qtltools.txt
+#   fi
+
+#   for NSV in {1..30}
+#   do
+#     BED=${BEDDIR}/QC2CALLSET_nsv${NSV}.${GROUP}.reordered.bed.gz
+
+#     for CHUNK in {1..300}
+#     do
+#       OUT=${RDR}/MATURERNA/${GROUP}_qtltools_nsv${NSV}_chunk${CHUNK}.txt
+#       echo "QTLtools cis --vcf ${VCF} --bed ${BED} --permute 10000 --chunk ${CHUNK} 300 --out ${OUT} --cov ${COV}" \
+#         >> ${SDR}/selfsched
+#     done
+#   done
+# done
+
+# # Count & split master list
+# wc -l ${SDR}/selfsched
+# split -a4 -d -l50 ${SDR}/selfsched ${SDR}/sch/selfsched_
+
+# # submit many mini-schedulers
+# cd ${SDR}
+# for i in `ls ${SDR}/sch/selfsched_???? | awk -F"_" '{print $NF}'`
+# do
+#   echo '#!/bin/bash
+# #BSUB -q premium
+# #BSUB -P acc_mscic1
+# #BSUB -J selfsched_'${i}'
+# #BSUB -n 11
+# #BSUB -W 5:00
+# #BSUB -R "rusage[mem=50000]"
+# #BSUB -cwd '${SDR}'/log
+# #BSUB -oo selfsched_'${i}'.stdout
+# #BSUB -eo selfsched_'${i}'.stderr
+# #BSUB -L /bin/bash
+# module load qtltools/1.1 tabix selfsched
+# cd '${SDR}'/log
+# export fstatus=selfsched_'${i}'.fstatus
+# mpirun -np 11 selfsched < '${SDR}'/sch/selfsched_'${i} > '${SDR}'/run/selfsched_'${i}'.run' > ${SDR}/run/selfsched_${i}.sh
+
+#   bsub < ${SDR}/run/selfsched_${i}.sh
+# done
+# #+END_SRC
+
+
+
